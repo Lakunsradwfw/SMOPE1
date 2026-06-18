@@ -376,6 +376,16 @@ class iIMAGENET_R(iDataset):
             )
         self.data = data_config["data"]
         self.targets = data_config["targets"]
+        # Split YAML uses "data/imagenet-r/..."; remap under self.root (dataroot).
+        def _resolve_split_path(p):
+            if not isinstance(p, str):
+                return p
+            pn = p.replace("\\", "/")
+            if pn.startswith("data/"):
+                return os.path.normpath(os.path.join(self.root, pn[5:]))
+            return p
+
+        self.data = [_resolve_split_path(p) for p in self.data]
 
     def __getitem__(self, index, simple=False):
         """

@@ -143,3 +143,22 @@ If you find our work or this codebase helpful, please consider citing:
   year={2025}
 }
 ```
+
+source .venv/bin/activate
+
+cd /ai/teacher/zq/SMoPE/data
+# ImageNet-R：HF-Mirror 上的整包（与官方同体积）
+wget -c --show-progress -O imagenet-r.tar \
+  "https://hf-mirror.com/flashingtt/imagenet-r/resolve/main/imagenet-r.tar" &
+# CUB-200-2011：fast.ai 镜像（官方同款 .tgz 布局）
+wget -c --show-progress -O CUB_200_2011.tgz \
+  "https://s3.amazonaws.com/fast-ai-imageclas/CUB_200_2011.tgz" &
+wait
+tar xf imagenet-r.tar
+tar xzf CUB_200_2011.tgz
+
+cd /ai/teacher/zq/SMoPE/pretrained
+curl -L -C - -o vit_base_patch16_224_augreg_in21k.bin "https://hf-mirror.com/timm/vit_base_patch16_224.augreg_in21k/resolve/main/pytorch_model.bin"
+curl -L -C - -o vit_base_patch16_224_augreg2_in21k_ft_in1k.bin "https://hf-mirror.com/timm/vit_base_patch16_224.augreg2_in21k_ft_in1k/resolve/main/pytorch_model.bin"
+curl -L -C - -o ibot_vit_base16.pth "https://lf3-nlp-opensource.bytetos.com/obj/nlp-opensource/archive/2022/ibot/vitb_16/checkpoint_teacher.pth"
+curl -L -C - -o dino_vitbase16_pretrain.pth "https://dl.fbaipublicfiles.com/dino/dino_vitbase16_pretrain/dino_vitbase16_pretrain.pth"

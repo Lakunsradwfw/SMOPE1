@@ -1,4 +1,8 @@
 # repo-specific stuff
+.cursor/
+.trellis/
+AGENTS.md
+continual_papers_feasibility_part3.md
 data/
 data
 outputs

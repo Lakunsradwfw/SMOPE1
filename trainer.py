@@ -1,6 +1,7 @@
 import os
 import sys
 import datetime
+import json
 from tqdm import tqdm, trange
 import math
 from timm.utils import accuracy
@@ -158,6 +159,8 @@ class Trainer:
             "top_k": self.top_k,
             "prompt_param": [self.num_tasks, args.prompt_param],
             "pretrained_weight": args.pretrained_weight,
+            "audit_freeze_component": args.audit_freeze_component,
+            "audit_freeze_from_task": args.audit_freeze_from_task,
         }
         self.learner_type, self.learner_name = args.learner_type, args.learner_name
         self.learner = learners.__dict__[self.learner_type].__dict__[self.learner_name](
@@ -177,6 +180,27 @@ class Trainer:
         self.ca_lr = args.ca_lr
         self.ca_weight_decay = args.ca_weight_decay
         self.ca_batch_size_ratio = args.ca_batch_size_ratio
+        self.audit_router = bool(args.audit_router)
+        self.audit_save_logits = bool(args.audit_save_logits)
+        self.audit_router_max_samples = max(0, int(args.audit_router_max_samples))
+        self.audit_checkpoints = {
+            checkpoint
+            for checkpoint in args.audit_checkpoints
+            if 1 <= checkpoint <= self.max_task
+        }
+        self.audit_checkpoints.add(self.max_task)
+        self.router_references = {}
+        self.component_references = {}
+        self.audit_dir = os.path.join(
+            self.log_dir, "forgetting_audit", f"repeat-{self.round_id + 1}"
+        )
+        if self.audit_router:
+            os.makedirs(self.audit_dir, exist_ok=True)
+            if self.round_id == 0 and args.overwrite:
+                for filename in ("router_audit.jsonl", "component_drift.jsonl"):
+                    path = os.path.join(self.log_dir, "forgetting_audit", filename)
+                    if os.path.exists(path):
+                        os.remove(path)
 
     def task_eval(self, t_index, local=False, task="acc"):
 
@@ -201,6 +225,302 @@ class Trainer:
             )
         else:
             return self.learner.validation(test_loader, task_metric=task)
+
+    def _audit_core_model(self):
+        model = self.learner.model
+        return model.module if hasattr(model, "module") else model
+
+    def _audit_task_loader(self, task_index):
+        self.test_dataset.load_dataset(task_index, train=True)
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=self.workers,
+            pin_memory=True,
+        )
+
+    def _audit_limit_batch(self, inputs, targets, seen):
+        if self.audit_router_max_samples <= 0:
+            return inputs, targets
+        remaining = self.audit_router_max_samples - seen
+        if remaining <= 0:
+            return None, None
+        return inputs[:remaining], targets[:remaining]
+
+    def _router_batch_record(self, prompt_scores, targets, sample_start):
+        topk = self._audit_core_model().prompt.topk
+        layers = {}
+        for layer_id, layer_scores in enumerate(prompt_scores):
+            if layer_scores is None or layer_scores[1] is None:
+                continue
+            raw_logits, selection_logits = layer_scores
+            values, indices = torch.topk(selection_logits, topk, dim=-1)
+            layer = {
+                "indices": indices.detach().cpu(),
+                "scores": values.detach().cpu(),
+            }
+            if self.audit_save_logits:
+                layer["raw_logits"] = raw_logits.detach().cpu()
+                layer["selection_logits"] = selection_logits.detach().cpu()
+            layers[layer_id] = layer
+        return {
+            "sample_start": int(sample_start),
+            "sample_indices": torch.arange(
+                sample_start, sample_start + targets.size(0), dtype=torch.long
+            ),
+            "targets": targets.detach().cpu(),
+            "layers": layers,
+        }
+
+    def _save_router_snapshot(self, kind, checkpoint_task, eval_task, batches):
+        directory = os.path.join(self.audit_dir, kind)
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(
+            directory,
+            f"checkpoint-{checkpoint_task}_eval-task-{eval_task}.pt",
+        )
+        torch.save(
+            {
+                "repeat_id": self.round_id + 1,
+                "seed": self.seed,
+                "checkpoint_task": checkpoint_task,
+                "eval_task": eval_task,
+                "topk": self._audit_core_model().prompt.topk,
+                "save_logits": self.audit_save_logits,
+                "batches": batches,
+            },
+            path,
+        )
+
+    def _capture_router_reference(self, task_index):
+        model = self.learner.model
+        was_training = model.training
+        model.eval()
+        batches = []
+        seen = 0
+        with torch.no_grad():
+            for inputs, targets, _ in self._audit_task_loader(task_index):
+                inputs, targets = self._audit_limit_batch(inputs, targets, seen)
+                if inputs is None or inputs.size(0) == 0:
+                    break
+                if self.learner.gpu:
+                    inputs = inputs.cuda()
+                scores = model(inputs, train=False, return_attn=True)
+                batch = self._router_batch_record(scores, targets, seen)
+                batches.append(batch)
+                seen += targets.size(0)
+        model.train(was_training)
+        self.router_references[task_index] = batches
+        self._save_router_snapshot(
+            "router_reference", task_index + 1, task_index + 1, batches
+        )
+
+    @staticmethod
+    def _snapshot_component_state(core):
+        prompt = core.prompt
+        return {
+            "key": {
+                name: parameter.detach().cpu().clone()
+                for name, parameter in prompt.named_parameters()
+                if "e_pk_" in name
+            },
+            "value": {
+                name: parameter.detach().cpu().clone()
+                for name, parameter in prompt.named_parameters()
+                if "e_pv_" in name
+            },
+            "classifier": {
+                name: value.detach().cpu().clone()
+                for name, value in core.last.state_dict().items()
+            },
+        }
+
+    def _capture_component_reference(self, task_index):
+        state = self._snapshot_component_state(self._audit_core_model())
+        self.component_references[task_index] = state
+        directory = os.path.join(self.audit_dir, "component_reference")
+        os.makedirs(directory, exist_ok=True)
+        torch.save(state, os.path.join(directory, f"task-{task_index + 1}.pt"))
+
+    @staticmethod
+    def _component_distance(current, reference):
+        squared = 0.0
+        reference_squared = 0.0
+        for name, old_value in reference.items():
+            new_value = current[name].to(dtype=torch.float64)
+            old_value = old_value.to(dtype=torch.float64)
+            squared += float(torch.sum((new_value - old_value) ** 2))
+            reference_squared += float(torch.sum(old_value**2))
+        l2 = math.sqrt(squared)
+        relative = l2 / max(math.sqrt(reference_squared), 1e-12)
+        return {"l2": l2, "relative_l2": relative}
+
+    @staticmethod
+    def _classifier_rows(state, row_count):
+        return {name: value[:row_count] for name, value in state.items()}
+
+    def _write_component_drift(self, checkpoint_index):
+        current = self._snapshot_component_state(self._audit_core_model())
+        path = os.path.join(self.log_dir, "forgetting_audit", "component_drift.jsonl")
+        for task_index in range(checkpoint_index + 1):
+            reference = self.component_references[task_index]
+            classifier_rows = sum(
+                len(self.tasks_logits[seen_task_index])
+                for seen_task_index in range(task_index + 1)
+            )
+            current_classifier = self._classifier_rows(
+                current["classifier"], classifier_rows
+            )
+            reference_classifier = self._classifier_rows(
+                reference["classifier"], classifier_rows
+            )
+            record = {
+                "event": "component_drift",
+                "repeat_id": self.round_id + 1,
+                "seed": self.seed,
+                "checkpoint_task": checkpoint_index + 1,
+                "reference_task": task_index + 1,
+                "classifier_rows": classifier_rows,
+                "key": self._component_distance(current["key"], reference["key"]),
+                "value": self._component_distance(
+                    current["value"], reference["value"]
+                ),
+                "classifier": self._component_distance(
+                    current_classifier, reference_classifier
+                ),
+            }
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _update_route_drift(current, reference, accumulator):
+        current = current.detach().cpu()
+        reference = reference.detach().cpu()
+        if tuple(current.shape) != tuple(reference.shape):
+            raise ValueError(
+                f"Current route shape {tuple(current.shape)} does not match "
+                f"historical shape {tuple(reference.shape)}."
+            )
+        changed = ~(
+            torch.sort(current, dim=-1).values
+            == torch.sort(reference, dim=-1).values
+        ).all(dim=-1)
+        intersection = (
+            current.unsqueeze(-1) == reference.unsqueeze(-2)
+        ).any(dim=-1).sum(dim=-1).to(torch.float32)
+        union = current.size(-1) * 2 - intersection
+        accumulator["changed"] += int(changed.sum())
+        accumulator["total"] += int(changed.numel())
+        accumulator["jaccard_sum"] += float((intersection / union.clamp(min=1)).sum())
+
+    def _audit_router_task(self, checkpoint_index, eval_task_index):
+        model = self.learner.model
+        was_training = model.training
+        model.eval()
+        reference_batches = self.router_references[eval_task_index]
+        current_batches = []
+        per_layer = {}
+        current_correct = replay_correct = total = seen = 0
+
+        with torch.no_grad():
+            for batch_index, (inputs, targets, _) in enumerate(
+                self._audit_task_loader(eval_task_index)
+            ):
+                inputs, targets = self._audit_limit_batch(inputs, targets, seen)
+                if inputs is None or inputs.size(0) == 0:
+                    break
+                if batch_index >= len(reference_batches):
+                    raise ValueError("Historical router reference has too few batches.")
+                reference_batch = reference_batches[batch_index]
+                if targets.size(0) != reference_batch["targets"].size(0):
+                    raise ValueError("Historical router batch size changed during replay.")
+                if not torch.equal(targets.cpu(), reference_batch["targets"]):
+                    raise ValueError(
+                        "Historical router sample order changed during replay."
+                    )
+                if self.learner.gpu:
+                    inputs = inputs.cuda()
+                    targets_device = targets.cuda()
+                else:
+                    targets_device = targets
+
+                scores = model(inputs, train=False, return_attn=True)
+                current_batch = self._router_batch_record(scores, targets, seen)
+                current_batches.append(current_batch)
+                forced = {}
+                for layer_id, reference_layer in reference_batch["layers"].items():
+                    forced[layer_id] = reference_layer["indices"]
+                    layer_accumulator = per_layer.setdefault(
+                        layer_id, {"changed": 0, "total": 0, "jaccard_sum": 0.0}
+                    )
+                    self._update_route_drift(
+                        current_batch["layers"][layer_id]["indices"],
+                        reference_layer["indices"],
+                        layer_accumulator,
+                    )
+
+                current_logits = model(inputs)[:, : self.learner.valid_out_dim]
+                replay_logits = model(
+                    inputs, forced_prompt_indices=forced
+                )[:, : self.learner.valid_out_dim]
+                current_correct += int(
+                    (current_logits.argmax(dim=1) == targets_device).sum().item()
+                )
+                replay_correct += int(
+                    (replay_logits.argmax(dim=1) == targets_device).sum().item()
+                )
+                total += int(targets_device.numel())
+                seen += targets.size(0)
+
+        model.train(was_training)
+        self._save_router_snapshot(
+            "router_current",
+            checkpoint_index + 1,
+            eval_task_index + 1,
+            current_batches,
+        )
+        changed = sum(item["changed"] for item in per_layer.values())
+        decisions = sum(item["total"] for item in per_layer.values())
+        jaccard_sum = sum(item["jaccard_sum"] for item in per_layer.values())
+        current_accuracy = 100.0 * current_correct / max(total, 1)
+        replay_accuracy = 100.0 * replay_correct / max(total, 1)
+        record = {
+            "event": "historical_router_replay",
+            "repeat_id": self.round_id + 1,
+            "seed": self.seed,
+            "checkpoint_task": checkpoint_index + 1,
+            "eval_task": eval_task_index + 1,
+            "samples": total,
+            "current_accuracy": current_accuracy,
+            "historical_router_accuracy": replay_accuracy,
+            "replay_gain": replay_accuracy - current_accuracy,
+            "router_change_rate": changed / max(decisions, 1),
+            "mean_topk_jaccard": jaccard_sum / max(decisions, 1),
+            "per_layer": {
+                str(layer_id): {
+                    "router_change_rate": item["changed"] / max(item["total"], 1),
+                    "mean_topk_jaccard": item["jaccard_sum"]
+                    / max(item["total"], 1),
+                }
+                for layer_id, item in per_layer.items()
+            },
+        }
+        path = os.path.join(self.log_dir, "forgetting_audit", "router_audit.jsonl")
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print(
+            "[forgetting-audit] "
+            f"T{checkpoint_index + 1} eval T{eval_task_index + 1}: "
+            f"route_change={record['router_change_rate']:.4f}, "
+            f"replay_gain={record['replay_gain']:.3f}"
+        )
+
+    def _run_forgetting_audit(self, checkpoint_index):
+        self._write_component_drift(checkpoint_index)
+        for eval_task_index in range(checkpoint_index + 1):
+            self._audit_router_task(checkpoint_index, eval_task_index)
 
     def train(self, avg_metrics):
 
@@ -303,6 +623,14 @@ class Trainer:
             # save model
             if re_train:
                 self.learner.save_model(model_save_dir)
+
+            if self.audit_router:
+                # Capture each task's own post-training route as the historical
+                # reference.  Later checkpoints replay these exact top-k choices.
+                self._capture_component_reference(i)
+                self._capture_router_reference(i)
+                if (i + 1) in self.audit_checkpoints:
+                    self._run_forgetting_audit(i)
 
             # evaluate acc -> NO NEED
             acc_table = []
@@ -514,7 +842,8 @@ class Trainer:
         param_list = [
             p
             for n, p in model.named_parameters()
-            if p.requires_grad and "prompt" not in n
+            if p.requires_grad
+            and "prompt" not in n
         ]
         network_params = [
             {"params": param_list, "lr": ca_lr, "weight_decay": weight_decay}
@@ -624,7 +953,31 @@ class Trainer:
 
                 optimizer.zero_grad()
                 loss.backward()
+                old_class_dim = sum(
+                    len(self.tasks_logits[old_task_id])
+                    for old_task_id in range(task_id)
+                )
+                freeze_classifier = (
+                    self.learner_config.get("audit_freeze_component")
+                    == "classifier"
+                    and (task_id + 1)
+                    >= int(self.learner_config.get("audit_freeze_from_task", 2))
+                    and old_class_dim > 0
+                )
+                frozen_weight = frozen_bias = None
+                if freeze_classifier:
+                    core = model.module if hasattr(model, "module") else model
+                    frozen_weight = core.last.weight[:old_class_dim].detach().clone()
+                    frozen_bias = core.last.bias[:old_class_dim].detach().clone()
+                    if core.last.weight.grad is not None:
+                        core.last.weight.grad[:old_class_dim].zero_()
+                    if core.last.bias.grad is not None:
+                        core.last.bias.grad[:old_class_dim].zero_()
                 optimizer.step()
+                if freeze_classifier:
+                    with torch.no_grad():
+                        core.last.weight[:old_class_dim].copy_(frozen_weight)
+                        core.last.bias[:old_class_dim].copy_(frozen_bias)
                 scheduler.step()  # step inside loop for Iter scheduler
 
                 metric_logger.update(Loss=loss.item())

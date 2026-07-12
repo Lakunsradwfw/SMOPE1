@@ -789,6 +789,7 @@ class ViTZoo(nn.Module):
         cls_mean=None,
         return_attn=False,
         dense=False,
+        forced_prompt_indices=None,
     ):
 
         reduce_query = False
@@ -818,6 +819,7 @@ class ViTZoo(nn.Module):
                     topk=topk,
                     return_attn=True,
                     reduce_query=reduce_query,
+                    forced_prompt_indices=forced_prompt_indices,
                 )
                 return prompt_scores
 
@@ -829,6 +831,7 @@ class ViTZoo(nn.Module):
                 task_id=self.task_id,
                 topk=topk,
                 reduce_query=reduce_query,
+                forced_prompt_indices=forced_prompt_indices,
             )
             out = out[:, 0, :]  # bs,197,768 -> bs,768 cls_token
             pre_logits = pre_logits[:, 0, :]

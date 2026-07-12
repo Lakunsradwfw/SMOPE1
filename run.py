@@ -94,6 +94,55 @@ def create_args():
         default=[1, 1, 1],
         help="e prompt pool size, e prompt length, g prompt length",
     )
+    parser.add_argument(
+        "--max_task",
+        type=int,
+        default=-1,
+        help="maximum number of continual-learning tasks; -1 runs all tasks",
+    )
+
+    # Forgetting-source audit.  All defaults preserve the original SMoPE path.
+    parser.add_argument(
+        "--audit_router",
+        action="store_true",
+        help=(
+            "record task-time router decisions and evaluate historical-router "
+            "replay at selected checkpoints"
+        ),
+    )
+    parser.add_argument(
+        "--audit_checkpoints",
+        nargs="+",
+        type=int,
+        default=[5, 10],
+        help="1-based task checkpoints for router replay (the final task is always added)",
+    )
+    parser.add_argument(
+        "--audit_router_max_samples",
+        type=int,
+        default=0,
+        help="maximum test samples per task for router audit; 0 uses the full task",
+    )
+    parser.add_argument(
+        "--audit_save_logits",
+        action="store_true",
+        help="also save full router logits; disabled by default to limit disk use",
+    )
+    parser.add_argument(
+        "--audit_freeze_component",
+        choices=["none", "prompt", "key", "value", "classifier"],
+        default="none",
+        help=(
+            "component held fixed from --audit_freeze_from_task onward; "
+            "classifier freezes old-class rows while allowing new rows to learn"
+        ),
+    )
+    parser.add_argument(
+        "--audit_freeze_from_task",
+        type=int,
+        default=2,
+        help="1-based first task on which the selected component is frozen",
+    )
 
     # new add Args
     parser.add_argument(

@@ -169,17 +169,48 @@ class OnePrompt(Prompt):
         )  # vit_pt_imnet
         return model
 
+    def _audit_freeze_active(self):
+        component = self.config.get("audit_freeze_component", "none")
+        from_task = int(self.config.get("audit_freeze_from_task", 2))
+        return component != "none" and (self.task_count + 1) >= from_task
+
+    def _keep_prompt_parameter(self, name):
+        if not self._audit_freeze_active():
+            return True
+        component = self.config.get("audit_freeze_component", "none")
+        if component == "prompt":
+            return False
+        if component == "key":
+            return "e_pk_" not in name
+        if component == "value":
+            return "e_pv_" not in name
+        return True
+
     def init_optimizer(self, epoch_factor=1):
 
         if len(self.config["gpuid"]) > 1:
-            base_params = list(self.model.module.prompt.parameters())
+            prompt_named_params = self.model.module.prompt.named_parameters()
+            base_params = [
+                p
+                for name, p in prompt_named_params
+                if p.requires_grad and self._keep_prompt_parameter(name)
+            ]
             base_fc_params = list(self.model.module.last.parameters())
         else:
             base_params = [
-                p for name, p in self.model.prompt.named_parameters() if p.requires_grad
+                p
+                for name, p in self.model.prompt.named_parameters()
+                if p.requires_grad and self._keep_prompt_parameter(name)
             ]
 
             base_fc_params = list(self.model.last.parameters())
+
+        if self._audit_freeze_active():
+            print(
+                "[forgetting-audit] task "
+                f"{self.task_count + 1}: freezing "
+                f"{self.config.get('audit_freeze_component')}"
+            )
 
         base_params = {
             "params": base_params,
@@ -253,7 +284,25 @@ class OnePrompt(Prompt):
         # step
         self.optimizer.zero_grad()
         total_loss.backward()
+        freeze_old_classifier = (
+            self._audit_freeze_active()
+            and self.config.get("audit_freeze_component") == "classifier"
+            and self.last_valid_out_dim > 0
+        )
+        frozen_weight = frozen_bias = None
+        if freeze_old_classifier:
+            core = self.model.module if hasattr(self.model, "module") else self.model
+            frozen_weight = core.last.weight[: self.last_valid_out_dim].detach().clone()
+            frozen_bias = core.last.bias[: self.last_valid_out_dim].detach().clone()
+            if core.last.weight.grad is not None:
+                core.last.weight.grad[: self.last_valid_out_dim].zero_()
+            if core.last.bias.grad is not None:
+                core.last.bias.grad[: self.last_valid_out_dim].zero_()
         self.optimizer.step()
+        if freeze_old_classifier:
+            with torch.no_grad():
+                core.last.weight[: self.last_valid_out_dim].copy_(frozen_weight)
+                core.last.bias[: self.last_valid_out_dim].copy_(frozen_bias)
 
         return total_loss.detach(), logits
 

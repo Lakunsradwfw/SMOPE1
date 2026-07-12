@@ -85,6 +85,7 @@ class Attention(nn.Module):
         topk=-1,
         train=False,
         reduce_query=False,
+        forced_indices=None,
     ):
         B, N, C = x.shape
         qkv = (
@@ -167,7 +168,23 @@ class Attention(nn.Module):
                 prompt_score_ - eps_decay
             )  # (B, num_heads, 1, num_prompt)
 
-            _, indices = torch.topk(prompt_score_label_, topk, dim=-1)
+            if forced_indices is None:
+                _, indices = torch.topk(prompt_score_label_, topk, dim=-1)
+            else:
+                indices = forced_indices.to(
+                    device=prompt_score_label_.device, dtype=torch.long
+                )
+                expected = (
+                    prompt_score_label_.size(0),
+                    prompt_score_label_.size(1),
+                    1,
+                    topk,
+                )
+                if tuple(indices.shape) != expected:
+                    raise ValueError(
+                        "Historical router indices have shape "
+                        f"{tuple(indices.shape)}, expected {expected}."
+                    )
             mask = (
                 torch.zeros_like(prompt_score_attn).scatter(-1, indices, 1).bool()
             )  # (B, num_heads, 1, num_prompt)
@@ -262,6 +279,7 @@ class Block(nn.Module):
         topk=-1,
         train=False,
         reduce_query=False,
+        forced_indices=None,
     ):
         h = x
         x = self.norm1(x)
@@ -272,6 +290,7 @@ class Block(nn.Module):
             topk=topk,
             train=train,
             reduce_query=reduce_query,
+            forced_indices=forced_indices,
         )
         x = h + self.drop_path(x)
 
@@ -395,6 +414,7 @@ class VisionTransformer(nn.Module):
         topk=-1,
         return_attn=False,
         reduce_query=False,
+        forced_prompt_indices=None,
     ):
         B = x.shape[0]
         x = self.patch_embed(x)
@@ -431,6 +451,11 @@ class VisionTransformer(nn.Module):
                 topk=topk,
                 train=train,
                 reduce_query=reduce_query,
+                forced_indices=(
+                    forced_prompt_indices.get(i)
+                    if forced_prompt_indices is not None
+                    else None
+                ),
             )
             prompt_scores.append(prompt_score)
 

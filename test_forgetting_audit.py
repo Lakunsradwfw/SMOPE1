@@ -1,9 +1,18 @@
+import json
+
 import torch
 from torch import nn
 
 from learners.prompt import OnePrompt as OnePromptLearner
-from models.vit import Attention
+from models.vit import Attention, VisionTransformer
 from trainer import Trainer
+from utils.audit_metrics import safe_recovery_ratio, vector_direction_metrics
+from utils.audit_state import temporary_state_updates
+from utils.summarize_forgetting_audit import (
+    build_accuracy_rows,
+    build_condition_rows,
+)
+from utils.summarize_expert_usage import summarize_expert_usage
 
 
 def test_historical_router_replay_accepts_exact_topk_indices():
@@ -31,6 +40,69 @@ def test_historical_router_replay_accepts_exact_topk_indices():
     assert torch.allclose(automatic, replayed)
 
 
+def test_identity_logits_replay_matches_historical_forward_at_same_checkpoint():
+    torch.manual_seed(11)
+    attention = Attention(dim=8, num_heads=2, qkv_bias=True)
+    attention.eval()
+    inputs = torch.randn(3, 5, 8)
+    prompt = [
+        torch.randn(3, 2, 4, 4),
+        torch.randn(3, 2, 4, 4),
+        torch.zeros(2, 4),
+    ]
+    automatic, scores = attention(inputs, prompt=prompt, topk=2, reduce_query=True)
+    indices = torch.topk(scores[1], k=2, dim=-1).indices
+    selected_raw_logits = torch.gather(scores[0], -1, indices)
+    replayed, _ = attention(
+        inputs,
+        prompt=prompt,
+        topk=2,
+        reduce_query=True,
+        forced_indices=indices,
+        forced_prompt_logits=selected_raw_logits,
+    )
+    assert torch.allclose(automatic, replayed)
+
+
+def test_forced_prompt_logits_shape_validation():
+    attention = Attention(dim=8, num_heads=2, qkv_bias=True)
+    inputs = torch.randn(2, 5, 8)
+    prompt = [
+        torch.randn(2, 2, 4, 4),
+        torch.randn(2, 2, 4, 4),
+        torch.zeros(2, 4),
+    ]
+    _, scores = attention(inputs, prompt=prompt, topk=2, reduce_query=True)
+    indices = torch.topk(scores[1], k=2, dim=-1).indices
+    try:
+        attention(
+            inputs,
+            prompt=prompt,
+            topk=2,
+            reduce_query=True,
+            forced_indices=indices,
+            forced_prompt_logits=torch.zeros(2, 2, 1, 1),
+        )
+    except ValueError as error:
+        assert "prompt logits" in str(error)
+    else:
+        raise AssertionError("Invalid historical prompt-logit shape was accepted.")
+
+
+def test_vit_prompt_loss_accumulator_is_device_safe_for_backward():
+    model = VisionTransformer(
+        img_size=8,
+        patch_size=4,
+        embed_dim=8,
+        depth=1,
+        num_heads=2,
+        mlp_ratio=2,
+    )
+    output, prompt_loss, _ = model(torch.randn(2, 3, 8, 8), train=True)
+    (output.sum() + prompt_loss.sum()).backward()
+    assert model.patch_embed.proj.weight.grad is not None
+
+
 def test_freeze_filters_key_and_value_independently():
     learner = object.__new__(OnePromptLearner)
     learner.task_count = 1
@@ -44,6 +116,36 @@ def test_freeze_filters_key_and_value_independently():
     learner.config["audit_freeze_component"] = "value"
     assert learner._keep_prompt_parameter("e_pk_0_0_0")
     assert not learner._keep_prompt_parameter("e_pv_0_0_0")
+
+
+def test_key_freeze_sets_requires_grad_false_and_grad_stays_none():
+    class TinyPrompt(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.e_pk_0_0_0 = nn.Parameter(torch.ones(1))
+            self.e_pv_0_0_0 = nn.Parameter(torch.ones(1))
+
+    class TinyCore(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.prompt = TinyPrompt()
+
+    learner = object.__new__(OnePromptLearner)
+    nn.Module.__init__(learner)
+    learner.model = TinyCore()
+    learner.task_count = 1
+    learner.config = {
+        "audit_freeze_component": "key",
+        "audit_freeze_from_task": 2,
+        "audit_freeze_until_task": 0,
+    }
+    learner._configure_audit_freeze_for_current_task()
+    key = learner.model.prompt.e_pk_0_0_0
+    value = learner.model.prompt.e_pv_0_0_0
+    assert not key.requires_grad
+    assert value.requires_grad
+    value.sum().backward()
+    assert key.grad is None
 
 
 def test_router_change_rate_is_topk_set_based():
@@ -108,3 +210,94 @@ def test_classifier_drift_ignores_future_class_rows():
         Trainer._classifier_rows(reference, 2),
     )
     assert distance == {"l2": 0.0, "relative_l2": 0.0}
+
+
+def test_negative_replay_gain_and_zero_forgetting_gap_are_preserved():
+    assert safe_recovery_ratio(-2.0, 4.0) == -0.5
+    assert torch.isnan(torch.tensor(safe_recovery_ratio(1.0, 0.0)))
+
+
+def test_gradient_direction_known_harmful_update_is_positive():
+    metrics = vector_direction_metrics(
+        old_gradient=torch.tensor([1.0, 0.0]),
+        new_gradient=torch.tensor([-1.0, 0.0]),
+        update=torch.tensor([0.5, 0.0]),
+    )
+    assert metrics["first_order_old_loss_change"] > 0
+    assert metrics["update_old_gradient_cosine"] == 1.0
+
+
+def test_temporary_component_restore_rolls_back_state():
+    module = nn.Linear(2, 2)
+    original = module.weight.detach().clone()
+    replacement = torch.full_like(original, 7.0)
+    with temporary_state_updates(module, {"weight": replacement}):
+        assert torch.equal(module.weight, replacement)
+    assert torch.equal(module.weight, original)
+
+
+def test_accuracy_matrix_pairing_exposes_plasticity_and_retention():
+    baseline = {
+        "run": "baseline",
+        "condition": "baseline",
+        "args": {"audit_freeze_component": "none"},
+        "num_tasks": 2,
+        "seeds": [0],
+        "matrices": {0: [[90.0, 80.0], [0.0, 85.0]]},
+        "global_history": [[90.0], [82.5]],
+        "fr_history": [[0.0], [10.0]],
+    }
+    frozen = {
+        "run": "freeze-key",
+        "condition": "key",
+        "args": {"audit_freeze_component": "key"},
+        "num_tasks": 2,
+        "seeds": [0],
+        "matrices": {0: [[90.0, 85.0], [0.0, 80.0]]},
+        "global_history": [[90.0], [82.5]],
+        "fr_history": [[0.0], [5.0]],
+    }
+    accuracy_rows = build_accuracy_rows([baseline, frozen], baseline)
+    frozen_task_one = next(
+        row
+        for row in accuracy_rows
+        if row["run"] == "freeze-key"
+        and row["eval_task"] == 1
+        and row["checkpoint_task"] == 2
+    )
+    assert frozen_task_one["plasticity_loss"] == 0.0
+    assert frozen_task_one["final_retention_gain"] == 5.0
+
+    condition_rows = build_condition_rows([baseline, frozen], baseline, 2.0, 1.0)
+    frozen_summary = next(row for row in condition_rows if row["run"] == "freeze-key")
+    assert frozen_summary["mean_new_task_plasticity_loss"] == 5.0
+    assert "LOWER_FR_WITH_LARGE_PLASTICITY_LOSS" in frozen_summary["interpretation_flags"]
+
+
+def test_expert_usage_count_conservation(tmp_path):
+    audit_dir = tmp_path / "run" / "forgetting_audit"
+    snapshot_dir = audit_dir / "repeat-1" / "router_current"
+    snapshot_dir.mkdir(parents=True)
+    with (audit_dir / "expert_structure.json").open("w", encoding="utf-8") as handle:
+        json.dump({"num_experts_per_layer_head": 3}, handle)
+    snapshot = {
+        "repeat_id": 1,
+        "seed": 0,
+        "checkpoint_task": 1,
+        "eval_task": 1,
+        "topk": 2,
+        "batches": [
+            {
+                "targets": torch.tensor([0, 1]),
+                "layers": {
+                    0: {
+                        "indices": torch.tensor([[[[0, 1]]], [[[1, 2]]]])
+                    }
+                },
+            }
+        ],
+    }
+    torch.save(snapshot, snapshot_dir / "checkpoint-1_eval-task-1.pt")
+    usage_rows, _ = summarize_expert_usage(tmp_path / "run")
+    assert sum(row["usage_count"] for row in usage_rows) == 2 * 2
+    assert abs(sum(row["usage_rate"] for row in usage_rows) - 1.0) < 1e-12

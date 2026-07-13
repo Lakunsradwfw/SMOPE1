@@ -125,8 +125,17 @@ def create_args():
     )
     parser.add_argument(
         "--audit_save_logits",
+        "--audit_save_full_router_logits",
+        dest="audit_save_logits",
         action="store_true",
         help="also save full router logits; disabled by default to limit disk use",
+    )
+    parser.add_argument(
+        "--audit_router_replay_modes",
+        nargs="+",
+        choices=["identity", "identity_prompt_logits"],
+        default=["identity", "identity_prompt_logits"],
+        help="historical router interventions evaluated at audit checkpoints",
     )
     parser.add_argument(
         "--audit_freeze_component",
@@ -142,6 +151,63 @@ def create_args():
         type=int,
         default=2,
         help="1-based first task on which the selected component is frozen",
+    )
+    parser.add_argument(
+        "--audit_freeze_until_task",
+        type=int,
+        default=0,
+        help="1-based last frozen task; 0 keeps the component frozen to the end",
+    )
+    parser.add_argument(
+        "--audit_expert_usage",
+        action="store_true",
+        help="derive task/layer/head/expert usage and soft ownership tables",
+    )
+    parser.add_argument(
+        "--audit_expert_usage_coverage",
+        type=float,
+        default=0.90,
+        help="usage coverage for high-frequency expert restoration",
+    )
+    parser.add_argument(
+        "--audit_gradient_direction",
+        action="store_true",
+        help="measure task-boundary old-loss gradients against real updates",
+    )
+    parser.add_argument(
+        "--audit_gradient_tasks",
+        choices=["all_old", "aggregate_old"],
+        default="all_old",
+        help="emit one record per old task or a single aggregate-old record",
+    )
+    parser.add_argument(
+        "--audit_gradient_max_samples",
+        type=int,
+        default=256,
+        help="maximum fixed training-set audit samples per task for gradients",
+    )
+    parser.add_argument(
+        "--audit_gradient_components",
+        nargs="+",
+        choices=["key", "value", "classifier"],
+        default=["key", "value", "classifier"],
+    )
+    parser.add_argument(
+        "--audit_router_margin_threshold",
+        type=float,
+        default=0.01,
+        help="raw router-score threshold used for near-boundary diagnostics",
+    )
+    parser.add_argument(
+        "--audit_save_full_checkpoints",
+        action="store_true",
+        help="save portable task checkpoints needed for offline restoration",
+    )
+    parser.add_argument(
+        "--audit_sample_manifest",
+        type=str,
+        default="",
+        help="optional reference audit_sample_manifest.json to validate/reuse",
     )
 
     # new add Args

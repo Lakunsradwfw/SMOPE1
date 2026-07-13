@@ -1,157 +1,153 @@
-# SMoPE 遗忘来源验证实验运行手册
+# SMoPE 遗忘来源验证实验运行手册（审查基础设施 v2）
 
-## 1. 固定基线
+## 1. 实验口径
 
-本实验组以 `master` 的 `a93fa54` 为唯一代码基线，使用相同的：
+代码基线为 `16e1f55`，算法对照基线为 `a93fa54`。所有横向比较必须保持：相同 seed、任务顺序、数据划分、审查样本、`MAX_TASK`、`CRCT_EPOCHS`、`prompt_param` 和 checkpoint。
 
-- CIFAR-100 十任务划分；
-- `prompt_param 50 5 1e-5 1e-5 0.4`；
-- seeds `0 1 2`；
-- `CRCT_EPOCHS=50`；
-- `MAX_TASK=10`；
-- 每个实验独立 `OUTDIR`。
+本实现把证据分为四类，不能混写：
 
-任何一项不一致时，不做横向归因比较。
+1. 自然训练中的参数/路由变化；
+2. 更新方向对旧任务损失的局部影响；
+3. 最终模型的组件恢复反事实；
+4. Freeze 训练干预及其塑性代价。
 
-## 2. 先做两任务冒烟验证
+未传任何 `--audit_*` 参数时，默认 SMoPE 前向、训练参数集合和输出保持原路径。梯度方向诊断默认关闭；它使用固定、无增强的训练集 audit 子集，不使用测试集梯度做训练或调参决策。
 
-先确认数据、预训练权重、Router 参考轨迹和历史回放路径可以完整执行：
+## 2. 先跑两任务冒烟
+
+先按 `README.md` 准备 CIFAR-100 和
+`pretrained/vit_base_patch16_224_augreg2_in21k_ft_in1k.bin`。当前审查脚本不会自动下载预训练权重。
 
 ```bash
-MAX_TASK=2 REPEAT=1 CRCT_EPOCHS=1 AUDIT_MAX_SAMPLES=256 GPUID=0 \
-OUTDIR=outputs/cifar-100/smoke/forgetting-audit-router \
-bash experiments/cifar-100_forgetting_audit_router.sh
+GPUID=0 bash experiments/cifar-100_forgetting_audit_smoke.sh
 ```
 
-成功标志：
+验收：
 
-- `output.log` 完成两个任务；
-- `forgetting_audit/router_audit.jsonl` 出现 `historical_router_replay`；
-- 日志包含 `route_change=` 和 `replay_gain=`；
-- `forgetting_audit/repeat-1/router_reference/` 有 Task 1、Task 2 的 `.pt` 文件。
+- 两个任务训练和评估完整结束；
+- `router_audit.jsonl` 同时含 `identity_replay_accuracy` 和 `identity_prompt_logits_replay_accuracy`；
+- `accuracy_long.csv`、`router_long.csv`、`drift_long.csv` 可在汇总后生成；
+- Task 1 在 Task 2 checkpoint 的路由回放可执行；
+- `models/repeat-1/task-*/checkpoint.pt` 存在；
+- 同 checkpoint 自回放时，路由 change rate 为 0、Jaccard 为 1、两级回放与自动前向一致（允许浮点误差）。
 
-冒烟试验只验证实现和数据链路，不用于论文结论。
+冒烟只验证实现链路，不用于论文结论。
 
-## 3. 正式实验顺序
+## 3. 再跑三任务配对交叉检查
 
-### A. Router 基线与恢复实验（最高优先级）
+单卡串行：
+
+```bash
+GPUID=0 bash experiments/cifar-100_forgetting_audit_crosscheck.sh
+```
+
+默认运行 baseline、freeze-key、freeze-value、freeze-classifier，配置为 `MAX_TASK=3 REPEAT=2 CRCT_EPOCHS=2 AUDIT_MAX_SAMPLES=128`。检查：
+
+- Freeze 条件复用 baseline 的 sample manifest；
+- 两个 seed 均能一一配对；
+- Freeze Key/Value 后仍有 Router Change；
+- Task 1 `plasticity_loss` 接近 0；
+- `requires_grad=False` 的冻结参数在反向后 `.grad is None`；
+- 低 FR 若没有最终旧任务保留收益，会产生 `LOWER_FR_WITHOUT_RETENTION_GAIN`。
+
+## 4. 正式 baseline 与 Freeze 实验
+
+脚本默认三 seed，适合机制筛查：
 
 ```bash
 GPUID=0 bash experiments/cifar-100_forgetting_audit_router.sh
-```
-
-这一次训练同时产生：
-
-1. 原始 FAA、CAA、FR 和 Accuracy Matrix；
-2. 每个任务刚学完时的历史 top-k Router 决策；
-3. Task 5、Task 10 的 Router Change Rate；
-4. 固定最终 Key/Value/Classifier、只回放历史 Router 的恢复准确率；
-5. Key、Value、Classifier 相对各历史任务检查点的参数漂移。
-
-默认保存 top-k expert 与对应 score，不保存全部 logits。若需要对少量样本检查完整 logits：
-
-```bash
-SAVE_ROUTER_LOGITS=1 AUDIT_MAX_SAMPLES=500 REPEAT=1 GPUID=0 \
-OUTDIR=outputs/cifar-100/10-task/forgetting-audit-router-logits \
-bash experiments/cifar-100_forgetting_audit_router.sh
-```
-
-不要对全量三种子默认开启完整 logits，文件会明显增大。
-
-### B. 冻结干预实验
-
-有多张 GPU 时分别启动：
-
-```bash
 GPUID=1 bash experiments/cifar-100_forgetting_audit_freeze_prompt.sh
 GPUID=2 bash experiments/cifar-100_forgetting_audit_freeze_key.sh
 GPUID=3 bash experiments/cifar-100_forgetting_audit_freeze_value.sh
 GPUID=4 bash experiments/cifar-100_forgetting_audit_freeze_classifier.sh
 ```
 
-只有一张 GPU 时按上述顺序串行运行，并都设 `GPUID=0`。
-
-- `prompt`：Task 2 起不再更新任何 Prompt expert；
-- `key`：Task 2 起冻结 `e_pk_*`，Value 仍可学习；
-- `value`：Task 2 起冻结 `e_pv_*`，Key 仍可学习；
-- `classifier`：Task 2 起冻结旧类别行，但允许新类别行学习，避免“整个分类头冻结后新类完全学不会”的混淆。
-
-冻结改变了优化路径，只能证明模块参与遗忘，不能单独证明它是唯一来源。
-
-## 4. 汇总结果
-
-五个实验完成后运行：
+正式统计建议至少五个配对 seed：
 
 ```bash
-python utils/summarize_forgetting_audit.py \
-  outputs/cifar-100/10-task/forgetting-audit-router \
-  outputs/cifar-100/10-task/forgetting-audit-freeze-prompt \
-  outputs/cifar-100/10-task/forgetting-audit-freeze-key \
-  outputs/cifar-100/10-task/forgetting-audit-freeze-value \
-  outputs/cifar-100/10-task/forgetting-audit-freeze-classifier \
-  --output outputs/cifar-100/10-task/forgetting_audit_summary.csv
+REPEAT=5 SEEDS="0 1 2 3 4" GPUID=0 bash experiments/cifar-100_forgetting_audit_router.sh
 ```
 
-本仓库的统计口径：
+其余 Freeze 脚本使用相同的 `REPEAT`、`SEEDS`、`MAX_TASK`、`CRCT_EPOCHS` 和 `AUDIT_MAX_SAMPLES`。如果 baseline 已先跑完，可让 Freeze 显式校验同一 manifest：
 
-- `FAA`：最后一个训练阶段的平均任务准确率；
-- `CAA`：各训练阶段平均准确率的均值；
-- `FR`：最后阶段的平均遗忘率；
-- Accuracy Matrix：`results-acc/pt.yaml`；
-- Router/Replay：`forgetting_audit/router_audit.jsonl`；
-- 参数漂移：`forgetting_audit/component_drift.jsonl`。
+```bash
+AUDIT_SAMPLE_MANIFEST=outputs/cifar-100/10-task/forgetting-audit-router/forgetting_audit/audit_sample_manifest.json \
+GPUID=2 bash experiments/cifar-100_forgetting_audit_freeze_key.sh
+```
 
-`results-acc/pt.yaml` 中：
+若多卡并行、baseline manifest 尚不存在，各条件会按确定性顺序生成自己的 manifest；最终汇总会逐 seed、逐任务核对样本 ID，不一致即报错。
 
-- `history` 保留每个 repeat/seed；
-- `mean` 是已完成 repeats 的均值，不是某个单独 seed。
+## 5. 梯度方向诊断
 
-## 5. 判读逻辑
+该诊断明显增加任务边界耗时和显存，只在自然训练 baseline 上单独执行：
 
-### Router 是主要来源
+```bash
+GPUID=0 AUDIT_MAX_SAMPLES=256 bash experiments/cifar-100_forgetting_audit_gradient.sh
+```
 
-需要同时看到：
+输出 `gradient_direction.jsonl`，区分：
 
-- 旧任务 Router Change Rate 较高；
-- 历史 Router 回放在多个旧任务、多个 seed 上稳定恢复准确率；
-- 回放只替换 top-k 访问路径，不恢复 Key、Value 或 Classifier 参数。
+- `main_prompt_training`；
+- `classifier_correction`。
 
-重点报告 Task 10 的旧任务平均 `replay_gain`，同时列出逐任务结果，不能只报总均值。
+核心字段为真实 AdamW 更新 `delta_theta` 对旧任务梯度的 `first_order_old_loss_change`、`update_old_gradient_cosine`、新旧梯度余弦，以及 Key 的 router margin/route flip。诊断通过 `torch.autograd.grad` 完成，不写入训练 `.grad`。
 
-### Key 漂移参与遗忘
+## 6. 最终模型组件恢复
 
-需要结合：
+baseline 必须用 `AUDIT_SAVE_FULL_CHECKPOINTS=1` 训练（router 脚本默认开启）。训练完成后：
 
-- Key 的 `relative_l2` 随任务增加；
-- 冻结 Key 相对基线降低 FR；
-- FAA/CAA 和新任务对角线没有出现不可接受的塑性损失；
-- Router 回放不能解释全部丢失性能。
+```bash
+GPUID=0 RUN_DIR=outputs/cifar-100/10-task/forgetting-audit-router \
+bash experiments/cifar-100_forgetting_audit_restore.sh
+```
 
-### Value 覆盖参与遗忘
+恢复条件包括：
 
-需要结合：
+- final；
+- router identity；
+- router identity + historical Prompt logits；
+- Key / Value / Classifier；
+- Key+Value、Router+Value、Router+Classifier、Key+Value+Classifier；
+- full historical checkpoint。
 
-- Value 的 `relative_l2` 明显增加；
-- 冻结 Value 降低 FR；
-- 历史 Router 回放后仍有较大未恢复差距。
+Key/Value 同时评估 `full_pool`、`used_experts` 和覆盖 90% 历史访问量的 `high_frequency_experts`。每个条件退出后检查状态回滚；负恢复 gain 和大于 1 的恢复比例均保留。
 
-### Classifier 冲突参与遗忘
+## 7. 统一汇总
 
-需要结合：
+五个 matched 条件完成后：
 
-- Classifier 漂移明显；
-- 冻结旧类别行降低 FR；
-- 新任务类别行仍能学习；
-- 同时检查 Accuracy Matrix 的新任务对角线，排除仅靠牺牲新任务学习换取低 FR。
+```bash
+bash experiments/cifar-100_forgetting_audit_summarize.sh
+```
 
-## 6. 最低结论标准
+输出目录默认为 `outputs/cifar-100/10-task/forgetting-audit-summary/`，包含：
 
-不要用单 seed、单任务或约 `0.1%` 的差异下结论。至少要求三种子方向一致，并同时报告：
+- `accuracy_long.csv`：完整 Accuracy Matrix、对角线、最终准确率、塑性损失、最终保留收益；
+- `router_long.csv`：逐 seed、逐任务、逐层两级回放和 baseline 路由分歧；
+- `drift_long.csv`：全池、旧任务使用专家、高频专家漂移；
+- `expert_usage_long.csv` / `expert_ownership_long.csv`：软专家所有权；
+- `paired_condition_summary.csv`：FAA/CAA/FR 与 matched delta；
+- `forgetting_audit_report.md`：配置检查、自动警告和允许/禁止结论。
 
-- FAA / CAA / FR 的 mean 与 std；
-- Task 10 的逐旧任务 Router Change Rate；
-- Task 10 的逐旧任务 Historical Replay Gain；
-- Key / Value / Classifier 漂移；
-- 冻结实验的新任务塑性代价。
+默认阈值单位为准确率百分点：
 
-每次重跑建议使用新的 `OUTDIR`，避免追加式 `output.log` 混入旧文本。
+```bash
+PLASTICITY_WARN_THRESHOLD=2.0 RETENTION_GAIN_THRESHOLD=1.0 \
+bash experiments/cifar-100_forgetting_audit_summarize.sh
+```
+
+少于五个 seed 时只报告描述性 paired effect，不使用“统计显著优于”措辞。
+
+## 8. 判读顺序
+
+先看 `paired_condition_summary.csv`：Freeze 是否真的提高最终旧任务准确率，而不是仅通过降低新任务对角线让 FR 变小。再看 `router_long.csv` 的两级回放，区分专家身份改变和 Prompt 注意力强度改变。随后用组件恢复和方向诊断检查功能因果链，最后才结合 Freeze 干预。
+
+只有以下证据方向一致时，才可说某组件是“重要贡献来源之一”：
+
+- 参数或路由确实变化；
+- 更新方向局部增加旧任务损失；
+- 最终模型恢复历史状态能恢复旧任务准确率；
+- Freeze 提高最终旧任务保留；
+- 新任务塑性代价较小，或有 matched-plasticity 对照排除。
+
+每次正式重跑使用新的 `OUTDIR`；仓库日志和 JSONL 采用追加式写入，复用旧目录会污染比较。

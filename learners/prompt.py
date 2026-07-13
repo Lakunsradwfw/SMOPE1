@@ -172,7 +172,35 @@ class OnePrompt(Prompt):
     def _audit_freeze_active(self):
         component = self.config.get("audit_freeze_component", "none")
         from_task = int(self.config.get("audit_freeze_from_task", 2))
-        return component != "none" and (self.task_count + 1) >= from_task
+        until_task = int(self.config.get("audit_freeze_until_task", 0))
+        current_task = self.task_count + 1
+        return (
+            component != "none"
+            and current_task >= from_task
+            and (until_task <= 0 or current_task <= until_task)
+        )
+
+    def _set_audit_component_trainable(self, component, trainable):
+        core = self.model.module if hasattr(self.model, "module") else self.model
+        for name, parameter in core.prompt.named_parameters():
+            selected = (
+                component == "prompt"
+                or (component == "key" and "e_pk_" in name)
+                or (component == "value" and "e_pv_" in name)
+            )
+            if selected:
+                parameter.requires_grad_(trainable)
+                parameter.grad = None
+
+    def _configure_audit_freeze_for_current_task(self):
+        # Optimizers are rebuilt at task boundaries.  Restore the default state
+        # first so a future bounded freeze can be safely lifted.
+        self._set_audit_component_trainable("prompt", True)
+        if not self._audit_freeze_active():
+            return
+        component = self.config.get("audit_freeze_component", "none")
+        if component in {"prompt", "key", "value"}:
+            self._set_audit_component_trainable(component, False)
 
     def _keep_prompt_parameter(self, name):
         if not self._audit_freeze_active():
@@ -187,6 +215,8 @@ class OnePrompt(Prompt):
         return True
 
     def init_optimizer(self, epoch_factor=1):
+
+        self._configure_audit_freeze_for_current_task()
 
         if len(self.config["gpuid"]) > 1:
             prompt_named_params = self.model.module.prompt.named_parameters()
@@ -222,7 +252,13 @@ class OnePrompt(Prompt):
             "lr": self.config["lr"],
             "weight_decay": self.config["weight_decay"],
         }
-        optimizer_arg = [base_params, base_fc_params]
+        optimizer_arg = []
+        if base_params["params"]:
+            optimizer_arg.append(base_params)
+        if base_fc_params["params"]:
+            optimizer_arg.append(base_fc_params)
+        if not optimizer_arg:
+            raise RuntimeError("Audit freeze left no trainable optimizer parameters.")
 
         total_params = sum(p.numel() for p in self.model.parameters())
         print("Total params:", total_params)
@@ -251,8 +287,8 @@ class OnePrompt(Prompt):
         elif self.schedule_type == "coswm":
             # print(self.config)
             scheduler_cfg = {
-                "base_value": [self.config["lr"] * 5, self.config["lr"]],
-                "final_value": [1e-6, 1e-6],
+                "base_value": [group["lr"] for group in optimizer_arg],
+                "final_value": [1e-6 for _ in optimizer_arg],
                 "optimizer": self.optimizer,
                 "iter_step": self.config["iter_step"],
                 "n_epochs": num_epochs,

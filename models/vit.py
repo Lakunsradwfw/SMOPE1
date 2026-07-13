@@ -86,6 +86,7 @@ class Attention(nn.Module):
         train=False,
         reduce_query=False,
         forced_indices=None,
+        forced_prompt_logits=None,
     ):
         B, N, C = x.shape
         qkv = (
@@ -185,6 +186,10 @@ class Attention(nn.Module):
                         "Historical router indices have shape "
                         f"{tuple(indices.shape)}, expected {expected}."
                     )
+            if forced_prompt_logits is not None and forced_indices is None:
+                raise ValueError(
+                    "Historical prompt logits require historical router indices."
+                )
             mask = (
                 torch.zeros_like(prompt_score_attn).scatter(-1, indices, 1).bool()
             )  # (B, num_heads, 1, num_prompt)
@@ -211,9 +216,27 @@ class Attention(nn.Module):
             pv_ = pv_.squeeze(2)  # shape: (B, num_heads, K, head_dim)
 
             v_ = torch.cat((pv_, v), dim=2)
+            if forced_prompt_logits is None:
+                selected_prompt_logits = q_prompt @ pk_.transpose(-2, -1)
+            else:
+                selected_prompt_logits = forced_prompt_logits.to(
+                    device=prompt_score_label_.device,
+                    dtype=prompt_score_.dtype,
+                )
+                expected = (
+                    prompt_score_label_.size(0),
+                    prompt_score_label_.size(1),
+                    1,
+                    topk,
+                )
+                if tuple(selected_prompt_logits.shape) != expected:
+                    raise ValueError(
+                        "Historical prompt logits have shape "
+                        f"{tuple(selected_prompt_logits.shape)}, expected {expected}."
+                    )
             attn = torch.cat(
                 (
-                    (q_prompt @ pk_.transpose(-2, -1)).expand(-1, -1, N, -1)
+                    selected_prompt_logits.expand(-1, -1, N, -1)
                     * self.scale,  # (B, num_heads, N, K)
                     attn[:, :, :, prompt_length:],
                 ),
@@ -280,6 +303,7 @@ class Block(nn.Module):
         train=False,
         reduce_query=False,
         forced_indices=None,
+        forced_prompt_logits=None,
     ):
         h = x
         x = self.norm1(x)
@@ -291,6 +315,7 @@ class Block(nn.Module):
             train=train,
             reduce_query=reduce_query,
             forced_indices=forced_indices,
+            forced_prompt_logits=forced_prompt_logits,
         )
         x = h + self.drop_path(x)
 
@@ -415,6 +440,7 @@ class VisionTransformer(nn.Module):
         return_attn=False,
         reduce_query=False,
         forced_prompt_indices=None,
+        forced_prompt_logits=None,
     ):
         B = x.shape[0]
         x = self.patch_embed(x)
@@ -427,7 +453,7 @@ class VisionTransformer(nn.Module):
         x = x + self.pos_embed[:, : x.size(1), :]
         x = self.pos_drop(x)
 
-        prompt_loss = torch.zeros((1,), requires_grad=True).cuda()
+        prompt_loss = x.new_zeros((1,))
 
         prompt_scores = []
 
@@ -454,6 +480,11 @@ class VisionTransformer(nn.Module):
                 forced_indices=(
                     forced_prompt_indices.get(i)
                     if forced_prompt_indices is not None
+                    else None
+                ),
+                forced_prompt_logits=(
+                    forced_prompt_logits.get(i)
+                    if forced_prompt_logits is not None
                     else None
                 ),
             )

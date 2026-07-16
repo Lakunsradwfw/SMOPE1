@@ -8,6 +8,8 @@ data
 output
 output/
 outputs
+tmp/
+tmp
 pretrained
 outputs/
 pretrained/

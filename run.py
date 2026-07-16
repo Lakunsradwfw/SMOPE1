@@ -214,6 +214,22 @@ def create_args():
         help="save portable task checkpoints needed for offline restoration",
     )
     parser.add_argument(
+        "--audit_cleanup_class_checkpoints",
+        action="store_true",
+        help=(
+            "remove transient models/repeat-*/task-*/class.pth files after "
+            "the repeat has been evaluated and all result YAML files are written"
+        ),
+    )
+    parser.add_argument(
+        "--audit_save_component_references",
+        action="store_true",
+        help=(
+            "persist per-task component-reference tensors for debugging; disabled "
+            "by default because component drift uses the in-memory references"
+        ),
+    )
+    parser.add_argument(
         "--audit_sample_manifest",
         type=str,
         default="",
@@ -438,6 +454,18 @@ if __name__ == "__main__":
                         yaml_results["history"] = result[:, : r + 1].tolist()
                     with open(save_file, "w") as yaml_file:
                         yaml.dump(yaml_results, yaml_file, default_flow_style=False)
+
+        # The accuracy matrix has been evaluated and every per-repeat result
+        # YAML has been written. Audit runs do not need these full model copies
+        # afterwards: baseline restoration uses checkpoint.pt instead.
+        if args.audit_cleanup_class_checkpoints:
+            removed = trainer.cleanup_class_checkpoints()
+            print(
+                "Removed",
+                len(removed),
+                "transient class.pth checkpoint(s) for repeat",
+                r + 1,
+            )
 
         # Print the summary so far
         print("===Summary of experiment repeats:", r + 1, "/", args.repeat, "===")

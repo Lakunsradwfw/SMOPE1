@@ -216,6 +216,12 @@ class Trainer:
         self.audit_gradient_components = tuple(args.audit_gradient_components)
         self.audit_router_margin_threshold = float(args.audit_router_margin_threshold)
         self.audit_save_full_checkpoints = bool(args.audit_save_full_checkpoints)
+        self.audit_cleanup_class_checkpoints = bool(
+            args.audit_cleanup_class_checkpoints
+        )
+        self.audit_save_component_references = bool(
+            args.audit_save_component_references
+        )
         self.audit_sample_manifest_source = str(args.audit_sample_manifest or "")
         self.audit_checkpoints = {
             checkpoint
@@ -553,9 +559,10 @@ class Trainer:
     def _capture_component_reference(self, task_index):
         state = self._snapshot_component_state(self._audit_core_model())
         self.component_references[task_index] = state
-        directory = os.path.join(self.audit_dir, "component_reference")
-        os.makedirs(directory, exist_ok=True)
-        torch.save(state, os.path.join(directory, f"task-{task_index + 1}.pt"))
+        if self.audit_save_component_references:
+            directory = os.path.join(self.audit_dir, "component_reference")
+            os.makedirs(directory, exist_ok=True)
+            torch.save(state, os.path.join(directory, f"task-{task_index + 1}.pt"))
 
     @staticmethod
     def _prompt_auxiliary_state(prompt):
@@ -591,6 +598,24 @@ class Trainer:
             "config": dict(self.learner_config),
         }
         torch.save(checkpoint, os.path.join(model_save_dir, "checkpoint.pt"))
+
+    def cleanup_class_checkpoints(self):
+        """Remove full model copies no longer needed after repeat evaluation."""
+        if not self.audit_cleanup_class_checkpoints:
+            return []
+        repeat_dir = os.path.join(
+            self.model_top_dir, "models", f"repeat-{self.round_id + 1}"
+        )
+        if not os.path.isdir(repeat_dir):
+            return []
+        removed = []
+        for directory, _, filenames in os.walk(repeat_dir):
+            if "class.pth" not in filenames:
+                continue
+            path = os.path.join(directory, "class.pth")
+            os.remove(path)
+            removed.append(path)
+        return removed
 
     @staticmethod
     def _component_distance(current, reference):

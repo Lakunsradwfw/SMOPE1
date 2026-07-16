@@ -15,11 +15,13 @@ AUDIT_MAX_SAMPLES=${AUDIT_MAX_SAMPLES:-0}
 AUDIT_CHECKPOINTS=${AUDIT_CHECKPOINTS:-"5 10"}
 SAVE_ROUTER_LOGITS=${SAVE_ROUTER_LOGITS:-0}
 AUDIT_SAMPLE_MANIFEST=${AUDIT_SAMPLE_MANIFEST:-}
+AUDIT_CLEANUP_CLASS_CHECKPOINTS=${AUDIT_CLEANUP_CLASS_CHECKPOINTS:-1}
 SEEDS=${SEEDS:-"0 1 2"}
 read -r -a SEED_ARRAY <<< "${SEEDS}"
 read -r -a CHECKPOINT_ARRAY <<< "${AUDIT_CHECKPOINTS}"
 AUDIT_ARGS=(--audit_expert_usage)
 if [[ "${SAVE_ROUTER_LOGITS}" == "1" ]]; then AUDIT_ARGS+=(--audit_save_full_router_logits); fi
+if [[ "${AUDIT_CLEANUP_CLASS_CHECKPOINTS}" == "1" ]]; then AUDIT_ARGS+=(--audit_cleanup_class_checkpoints); fi
 if [[ -n "${AUDIT_SAMPLE_MANIFEST}" ]]; then AUDIT_ARGS+=(--audit_sample_manifest "${AUDIT_SAMPLE_MANIFEST}"); fi
 
 mkdir -p "${OUTDIR}"

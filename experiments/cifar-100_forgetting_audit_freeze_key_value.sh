@@ -18,6 +18,7 @@ SAVE_ROUTER_LOGITS=${SAVE_ROUTER_LOGITS:-0}
 SEEDS=${SEEDS:-"0 1 2"}
 BASELINE_OUTDIR=${BASELINE_OUTDIR:-outputs/${DATASET}/10-task/forgetting-audit-router}
 AUDIT_SAMPLE_MANIFEST=${AUDIT_SAMPLE_MANIFEST:-${BASELINE_OUTDIR}/forgetting_audit/audit_sample_manifest.json}
+AUDIT_CLEANUP_CLASS_CHECKPOINTS=${AUDIT_CLEANUP_CLASS_CHECKPOINTS:-1}
 
 if [[ ! -f "${AUDIT_SAMPLE_MANIFEST}" ]]; then
   echo "Missing matched baseline manifest: ${AUDIT_SAMPLE_MANIFEST}" >&2
@@ -29,6 +30,7 @@ read -r -a SEED_ARRAY <<< "${SEEDS}"
 read -r -a CHECKPOINT_ARRAY <<< "${AUDIT_CHECKPOINTS}"
 AUDIT_ARGS=(--audit_expert_usage --audit_sample_manifest "${AUDIT_SAMPLE_MANIFEST}")
 if [[ "${SAVE_ROUTER_LOGITS}" == "1" ]]; then AUDIT_ARGS+=(--audit_save_full_router_logits); fi
+if [[ "${AUDIT_CLEANUP_CLASS_CHECKPOINTS}" == "1" ]]; then AUDIT_ARGS+=(--audit_cleanup_class_checkpoints); fi
 
 mkdir -p "${OUTDIR}"
 python -u run.py --config "${CONFIG}" \

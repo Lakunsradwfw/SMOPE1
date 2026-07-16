@@ -176,6 +176,8 @@ def make_trainer(run_dir, run_args, seed, repeat_index, gpuid):
         "audit_gradient_components": ["key", "value", "classifier"],
         "audit_router_margin_threshold": 0.01,
         "audit_save_full_checkpoints": False,
+        "audit_cleanup_class_checkpoints": False,
+        "audit_save_component_references": False,
         "audit_sample_manifest": "",
         "audit_save_logits": False,
     }

@@ -77,6 +77,10 @@ GPUID=2 bash experiments/cifar-100_forgetting_audit_freeze_key.sh
 
 若多卡并行、baseline manifest 尚不存在，各条件会按确定性顺序生成自己的 manifest；最终汇总会逐 seed、逐任务核对样本 ID，不一致即报错。
 
+审查脚本默认在每个 repeat 的 Accuracy Matrix 已评估、全部结果 YAML 已写入后，删除该 repeat 的
+`models/repeat-*/task-*/class.pth` 临时完整模型副本。若需要保留它们用于中断续跑，可显式传入
+`AUDIT_CLEANUP_CLASS_CHECKPOINTS=0`；这不会影响已完成 repeat 的汇总结果。
+
 ## 5. 梯度方向诊断
 
 该诊断明显增加任务边界耗时和显存，只在自然训练 baseline 上单独执行：
@@ -84,6 +88,9 @@ GPUID=2 bash experiments/cifar-100_forgetting_audit_freeze_key.sh
 ```bash
 GPUID=0 AUDIT_MAX_SAMPLES=256 bash experiments/cifar-100_forgetting_audit_gradient.sh
 ```
+
+梯度脚本默认不保存 `checkpoint.pt`，因为组件恢复只在 router baseline 上执行；如确有单独恢复梯度
+实验模型的需要，再显式设置 `AUDIT_SAVE_FULL_CHECKPOINTS=1`。
 
 输出 `gradient_direction.jsonl`，区分：
 
@@ -111,6 +118,9 @@ bash experiments/cifar-100_forgetting_audit_restore.sh
 - full historical checkpoint。
 
 Key/Value 同时评估 `full_pool`、`used_experts` 和覆盖 90% 历史访问量的 `high_frequency_experts`。每个条件退出后检查状态回滚；负恢复 gain 和大于 1 的恢复比例均保留。
+
+组件参考张量默认仅在训练进程内保留，用于计算 `component_drift.jsonl`，不会再写入
+`component_reference/*.pt`。只有排查实现问题时才传入 `--audit_save_component_references` 持久化它们。
 
 ## 7. 统一汇总
 

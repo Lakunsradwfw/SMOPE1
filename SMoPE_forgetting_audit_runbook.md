@@ -81,6 +81,17 @@ GPUID=2 bash experiments/cifar-100_forgetting_audit_freeze_key.sh
 `models/repeat-*/task-*/class.pth` 临时完整模型副本。若需要保留它们用于中断续跑，可显式传入
 `AUDIT_CLEANUP_CLASS_CHECKPOINTS=0`；这不会影响已完成 repeat 的汇总结果。
 
+清理服务器已有输出时，先预览再执行：
+
+```bash
+bash experiments/cleanup_forgetting_audit_outputs.sh --root outputs/cifar-100/10-task
+bash experiments/cleanup_forgetting_audit_outputs.sh --root outputs/cifar-100/10-task --apply
+```
+
+该脚本只清理三份结果 YAML 均有效且 repeat 数一致的已完成 repeat；始终保留
+`forgetting-audit-router` 的 `checkpoint.pt`。如需清理旧梯度等非 baseline 条件曾保存的完整
+checkpoint，再额外加入 `--delete-nonbaseline-checkpoints`。
+
 ## 5. 梯度方向诊断
 
 该诊断明显增加任务边界耗时和显存，只在自然训练 baseline 上单独执行：

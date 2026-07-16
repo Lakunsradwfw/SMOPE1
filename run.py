@@ -235,6 +235,30 @@ def create_args():
         default="",
         help="optional reference audit_sample_manifest.json to validate/reuse",
     )
+    parser.add_argument(
+        "--audit_expert_interference",
+        action="store_true",
+        help=(
+            "measure within-expert cross-task conflict above a same-task "
+            "split-half control, then match it to the real update, functional "
+            "drift, and forgetting using compact aggregated records"
+        ),
+    )
+    parser.add_argument(
+        "--audit_mechanism_max_samples",
+        type=int,
+        default=256,
+        help=(
+            "even number >= 4 of deterministic stratified training samples "
+            "per task; split into two disjoint halves for the same-task control"
+        ),
+    )
+    parser.add_argument(
+        "--audit_mechanism_gradient_epsilon",
+        type=float,
+        default=1e-12,
+        help="minimum expert-gradient norm for a valid conflict pair",
+    )
 
     # new add Args
     parser.add_argument(

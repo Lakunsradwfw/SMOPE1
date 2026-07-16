@@ -3,6 +3,7 @@ import sys
 import datetime
 import json
 import hashlib
+import gzip
 from tqdm import tqdm, trange
 import math
 from timm.utils import accuracy
@@ -11,10 +12,11 @@ import torch
 import numpy as np
 import random
 from random import shuffle
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
+from contextlib import contextmanager
 import dataloaders
 from dataloaders.utils import *
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from typing import Iterable
 import learners
 from utils import utils_tap
@@ -23,6 +25,12 @@ from utils.audit_metrics import (
     SCHEMA_VERSION,
     route_set_metrics,
     vector_direction_metrics,
+)
+from utils.expert_interference import (
+    gradient_pair_metrics,
+    stratified_probe_indices,
+    tensor_drift_metrics,
+    update_harm_metrics,
 )
 
 
@@ -136,7 +144,7 @@ class Trainer:
             validation=args.validation,
         )
         self.audit_gradient_dataset = None
-        if bool(args.audit_gradient_direction):
+        if bool(args.audit_gradient_direction or args.audit_expert_interference):
             # Gradient diagnostics must not use test-set gradients.  This is a
             # deterministic, non-augmented view of the training archive and is
             # used only for measurements, never for optimizer decisions.
@@ -223,6 +231,22 @@ class Trainer:
             args.audit_save_component_references
         )
         self.audit_sample_manifest_source = str(args.audit_sample_manifest or "")
+        self.audit_expert_interference = bool(args.audit_expert_interference)
+        self.audit_mechanism_max_samples = max(
+            1, int(args.audit_mechanism_max_samples)
+        )
+        if self.audit_expert_interference and (
+            self.audit_mechanism_max_samples < 4
+            or self.audit_mechanism_max_samples % 2 != 0
+        ):
+            raise ValueError(
+                "--audit_mechanism_max_samples must be an even integer >= 4 "
+                "when --audit_expert_interference is enabled, because the "
+                "same-task noise control uses two disjoint probe halves."
+            )
+        self.audit_mechanism_gradient_epsilon = float(
+            args.audit_mechanism_gradient_epsilon
+        )
         self.audit_checkpoints = {
             checkpoint
             for checkpoint in args.audit_checkpoints
@@ -240,6 +264,7 @@ class Trainer:
             or self.audit_expert_usage
             or self.audit_gradient_direction
             or self.audit_save_full_checkpoints
+            or self.audit_expert_interference
             or args.audit_freeze_component != "none"
         )
         if self.audit_enabled:
@@ -267,6 +292,30 @@ class Trainer:
                 ):
                     os.remove(manifest_path)
             self._write_expert_structure()
+
+        self.mechanism_dir = os.path.join(self.log_dir, "expert_interference")
+        self.mechanism_probe_indices = {}
+        self.mechanism_reference_queries = {}
+        self.mechanism_reference_responses = {}
+        self.mechanism_reference_values = {}
+        self.mechanism_previous_responses = {}
+        self.mechanism_previous_parameters = None
+        self.mechanism_reference_usage = {}
+        self.mechanism_reference_soft_usage = {}
+        self.mechanism_accuracy_history = {}
+        if self.audit_expert_interference:
+            os.makedirs(self.mechanism_dir, exist_ok=True)
+            if self.round_id == 0 and args.overwrite:
+                for filename in (
+                    "probe_manifest.jsonl",
+                    "expert_usage.jsonl.gz",
+                    "expert_task_pair_conflict.jsonl.gz",
+                    "expert_functional_drift.jsonl.gz",
+                    "task_forgetting.jsonl",
+                ):
+                    path = os.path.join(self.mechanism_dir, filename)
+                    if os.path.exists(path):
+                        os.remove(path)
 
     def task_eval(self, t_index, local=False, task="acc"):
 
@@ -1216,6 +1265,779 @@ class Trainer:
                 with open(path, "a", encoding="utf-8") as handle:
                     handle.write(json.dumps(record, allow_nan=True) + "\n")
 
+    @contextmanager
+    def _preserve_rng_state(self):
+        """Keep measurement-only probes from changing the training trajectory."""
+        python_state = random.getstate()
+        numpy_state = np.random.get_state()
+        torch_state = torch.get_rng_state()
+        cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        try:
+            yield
+        finally:
+            random.setstate(python_state)
+            np.random.set_state(numpy_state)
+            torch.set_rng_state(torch_state)
+            if cuda_states is not None:
+                torch.cuda.set_rng_state_all(cuda_states)
+
+    def _append_mechanism_records(self, filename, records, compressed=False):
+        records = list(records)
+        if not records:
+            return
+        path = os.path.join(self.mechanism_dir, filename)
+        opener = gzip.open if compressed else open
+        with opener(path, "at", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, allow_nan=True) + "\n")
+
+    def _mechanism_probe_loader(self, task_index, split="full"):
+        if self.audit_gradient_dataset is None:
+            raise RuntimeError("Expert-interference probe dataset was not initialized.")
+        self.audit_gradient_dataset.load_dataset(task_index, train=True)
+        if task_index not in self.mechanism_probe_indices:
+            probe_seed = int(self.seed * 1009 + task_index * 9176 + 41)
+            indices = stratified_probe_indices(
+                self.audit_gradient_dataset.targets,
+                self.audit_mechanism_max_samples,
+                probe_seed,
+            )
+            self.mechanism_probe_indices[task_index] = indices
+            targets = np.asarray(self.audit_gradient_dataset.targets)[indices]
+            classes, counts = np.unique(targets, return_counts=True)
+            digest = hashlib.sha256(
+                np.asarray(indices, dtype=np.int64).tobytes()
+            ).hexdigest()
+            self._append_mechanism_records(
+                "probe_manifest.jsonl",
+                [
+                    {
+                        "event": "probe_manifest",
+                        "schema_version": SCHEMA_VERSION,
+                        "repeat_id": self.round_id + 1,
+                        "seed": self.seed,
+                        "task": task_index + 1,
+                        "split": "train_nonaugmented_stratified",
+                        "samples": len(indices),
+                        "probe_seed": probe_seed,
+                        "indices_sha256": digest,
+                        "class_counts": {
+                            str(int(class_id)): int(count)
+                            for class_id, count in zip(classes, counts)
+                        },
+                    }
+                ],
+            )
+        indices = self.mechanism_probe_indices[task_index]
+        if split == "half_a":
+            indices = indices[0::2]
+        elif split == "half_b":
+            indices = indices[1::2]
+        elif split != "full":
+            raise ValueError(f"Unknown mechanism probe split: {split}")
+        if not indices:
+            raise ValueError(
+                f"Mechanism probe split {split} for task {task_index + 1} is empty."
+            )
+        subset = Subset(self.audit_gradient_dataset, indices)
+        return DataLoader(
+            subset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=0,
+            pin_memory=True,
+        )
+
+    def _mechanism_expert_parameters(self):
+        experts = {}
+        for name, parameter in self._audit_core_model().prompt.named_parameters():
+            if not (name.startswith("e_pk_") or name.startswith("e_pv_")):
+                continue
+            coordinate = self._expert_coordinates(name)
+            component = "key" if name.startswith("e_pk_") else "value"
+            experts.setdefault(coordinate, {})[component] = parameter
+        return experts
+
+    def _mechanism_gradient_vectors(
+        self, task_index, training_objective=False, split="full"
+    ):
+        experts = self._mechanism_expert_parameters()
+        flat = [
+            (coordinate, component, parameter)
+            for coordinate, components in sorted(experts.items())
+            for component, parameter in sorted(components.items())
+        ]
+        parameters = [parameter for _, _, parameter in flat]
+        original_requires_grad = [parameter.requires_grad for parameter in parameters]
+        for parameter in parameters:
+            parameter.requires_grad_(True)
+        accumulators = [
+            torch.zeros_like(parameter, device="cpu", dtype=torch.float64)
+            for parameter in parameters
+        ]
+        model = self.learner.model
+        was_training = model.training
+        seen = 0
+        weighted_loss = 0.0
+        model.train(training_objective)
+        try:
+            for inputs, targets, _ in self._mechanism_probe_loader(
+                task_index, split=split
+            ):
+                if self.learner.gpu:
+                    inputs = inputs.cuda()
+                    targets = targets.cuda()
+                if training_objective:
+                    logits, prompt_loss = model(inputs, train=True)
+                    logits = logits[:, : self.learner.valid_out_dim].clone()
+                    logits[:, : self.learner.last_valid_out_dim] = -float("inf")
+                    loss = torch.nn.functional.cross_entropy(
+                        logits, targets.long(), reduction="mean"
+                    ) + prompt_loss.sum()
+                else:
+                    logits = model(inputs)[:, : self.learner.valid_out_dim]
+                    loss = torch.nn.functional.cross_entropy(
+                        logits, targets.long(), reduction="mean"
+                    )
+                gradients = torch.autograd.grad(
+                    loss,
+                    parameters,
+                    allow_unused=True,
+                    retain_graph=False,
+                    create_graph=False,
+                )
+                batch_samples = int(targets.numel())
+                weighted_loss += float(loss.detach()) * batch_samples
+                for index, gradient in enumerate(gradients):
+                    if gradient is not None:
+                        accumulators[index].add_(
+                            gradient.detach().cpu().to(torch.float64)
+                            * batch_samples
+                        )
+                seen += batch_samples
+        finally:
+            model.train(was_training)
+            for parameter, requires_grad in zip(parameters, original_requires_grad):
+                parameter.requires_grad_(requires_grad)
+        if seen == 0:
+            raise ValueError(f"Mechanism probe task {task_index + 1} has no samples.")
+        result = {coordinate: {} for coordinate in experts}
+        for (coordinate, component, _), accumulator in zip(flat, accumulators):
+            result[coordinate][component] = accumulator / seen
+        return {
+            "gradients": result,
+            "samples": seen,
+            "mean_loss": weighted_loss / seen,
+            "split": split,
+            "training_objective": bool(training_objective),
+        }
+
+    @staticmethod
+    def _merge_mechanism_gradient_halves(first, second):
+        total = int(first["samples"]) + int(second["samples"])
+        merged = {}
+        for coordinate in first["gradients"]:
+            merged[coordinate] = {}
+            for component in first["gradients"][coordinate]:
+                merged[coordinate][component] = (
+                    first["gradients"][coordinate][component] * first["samples"]
+                    + second["gradients"][coordinate][component] * second["samples"]
+                ) / total
+        return {
+            "gradients": merged,
+            "samples": total,
+            "mean_loss": (
+                first["mean_loss"] * first["samples"]
+                + second["mean_loss"] * second["samples"]
+            )
+            / total,
+            "split": "full_from_disjoint_halves",
+            "training_objective": first["training_objective"],
+        }
+
+    def _mechanism_task_gradient_halves(self, task_index, training_objective=False):
+        first = self._mechanism_gradient_vectors(
+            task_index, training_objective=training_objective, split="half_a"
+        )
+        second = self._mechanism_gradient_vectors(
+            task_index, training_objective=training_objective, split="half_b"
+        )
+        return {
+            "half_a": first,
+            "half_b": second,
+            "full": self._merge_mechanism_gradient_halves(first, second),
+        }
+
+    @staticmethod
+    def _concat_expert_components(gradient_result, coordinate):
+        return torch.cat(
+            [
+                gradient_result[coordinate][component].reshape(-1)
+                for component in ("key", "value")
+            ]
+        )
+
+    def _mechanism_task_loss(self, task_index):
+        model = self.learner.model
+        was_training = model.training
+        model.eval()
+        total_loss = 0.0
+        seen = 0
+        with torch.no_grad():
+            for inputs, targets, _ in self._mechanism_probe_loader(task_index):
+                if self.learner.gpu:
+                    inputs = inputs.cuda()
+                    targets = targets.cuda()
+                logits = model(inputs)[:, : self.learner.valid_out_dim]
+                loss = torch.nn.functional.cross_entropy(
+                    logits, targets.long(), reduction="sum"
+                )
+                total_loss += float(loss)
+                seen += int(targets.numel())
+        model.train(was_training)
+        if seen == 0:
+            raise ValueError(f"Mechanism probe task {task_index + 1} has no samples.")
+        return total_loss / seen
+
+    def _prepare_expert_task_pair_audit(self, train_task_index):
+        old_tasks = {
+            task_index: self._mechanism_task_gradient_halves(task_index)
+            for task_index in range(train_task_index)
+        }
+        new_task = self._mechanism_task_gradient_halves(
+            train_task_index, training_objective=True
+        )
+        new_pretraining_probe = self._mechanism_functional_probe(train_task_index)
+        return {
+            "train_task_index": train_task_index,
+            "old_tasks": old_tasks,
+            "new_task": new_task,
+            "new_pretraining_probe": new_pretraining_probe,
+            "before_parameters": self._snapshot_mechanism_parameters(),
+        }
+
+    def _write_expert_task_pair_audit(self, prepared):
+        train_task_index = int(prepared["train_task_index"])
+        after_parameters = self._snapshot_mechanism_parameters()
+        post_old_losses = {
+            task_index: self._mechanism_task_loss(task_index)
+            for task_index in prepared["old_tasks"]
+        }
+        records = []
+        for old_task_index, old_task in prepared["old_tasks"].items():
+            observed_old_loss_change = (
+                post_old_losses[old_task_index] - old_task["full"]["mean_loss"]
+            )
+            for coordinate in sorted(after_parameters):
+                layer, head, expert = coordinate
+                component_records = {}
+                for component in ("key", "value"):
+                    old_full = old_task["full"]["gradients"][coordinate][component]
+                    new_full = prepared["new_task"]["full"]["gradients"][
+                        coordinate
+                    ][component]
+                    update = (
+                        after_parameters[coordinate][component]
+                        - prepared["before_parameters"][coordinate][component]
+                    )
+                    component_records[component] = {
+                        "cross_task": gradient_pair_metrics(
+                            old_full,
+                            new_full,
+                            epsilon=self.audit_mechanism_gradient_epsilon,
+                        ),
+                        "same_old_task": gradient_pair_metrics(
+                            old_task["half_a"]["gradients"][coordinate][component],
+                            old_task["half_b"]["gradients"][coordinate][component],
+                            epsilon=self.audit_mechanism_gradient_epsilon,
+                        ),
+                        "same_new_task": gradient_pair_metrics(
+                            prepared["new_task"]["half_a"]["gradients"][coordinate][
+                                component
+                            ],
+                            prepared["new_task"]["half_b"]["gradients"][coordinate][
+                                component
+                            ],
+                            epsilon=self.audit_mechanism_gradient_epsilon,
+                        ),
+                        "actual_update": update_harm_metrics(
+                            old_full,
+                            update,
+                            epsilon=self.audit_mechanism_gradient_epsilon,
+                        ),
+                    }
+
+                old_full_combined = self._concat_expert_components(
+                    old_task["full"]["gradients"], coordinate
+                )
+                new_full_combined = self._concat_expert_components(
+                    prepared["new_task"]["full"]["gradients"], coordinate
+                )
+                old_half_a = self._concat_expert_components(
+                    old_task["half_a"]["gradients"], coordinate
+                )
+                old_half_b = self._concat_expert_components(
+                    old_task["half_b"]["gradients"], coordinate
+                )
+                new_half_a = self._concat_expert_components(
+                    prepared["new_task"]["half_a"]["gradients"], coordinate
+                )
+                new_half_b = self._concat_expert_components(
+                    prepared["new_task"]["half_b"]["gradients"], coordinate
+                )
+                combined_update = torch.cat(
+                    [
+                        (
+                            after_parameters[coordinate][component]
+                            - prepared["before_parameters"][coordinate][component]
+                        ).reshape(-1)
+                        for component in ("key", "value")
+                    ]
+                )
+                cross_task = gradient_pair_metrics(
+                    old_full_combined,
+                    new_full_combined,
+                    epsilon=self.audit_mechanism_gradient_epsilon,
+                )
+                same_old = gradient_pair_metrics(
+                    old_half_a,
+                    old_half_b,
+                    epsilon=self.audit_mechanism_gradient_epsilon,
+                )
+                same_new = gradient_pair_metrics(
+                    new_half_a,
+                    new_half_b,
+                    epsilon=self.audit_mechanism_gradient_epsilon,
+                )
+                same_controls = [
+                    value["negative_cosine"]
+                    for value in (same_old, same_new)
+                    if value["valid_gradient_pair"]
+                ]
+                same_task_control = (
+                    float(np.mean(same_controls)) if same_controls else math.nan
+                )
+                excess_conflict = (
+                    cross_task["negative_cosine"] - same_task_control
+                    if cross_task["valid_gradient_pair"]
+                    and math.isfinite(same_task_control)
+                    else math.nan
+                )
+                old_usage = self.mechanism_reference_usage[old_task_index].get(
+                    coordinate, 0.0
+                )
+                new_usage = prepared["new_pretraining_probe"]["usage"].get(
+                    coordinate, 0.0
+                )
+                records.append(
+                    {
+                        "event": "within_expert_task_pair",
+                        "schema_version": SCHEMA_VERSION,
+                        "repeat_id": self.round_id + 1,
+                        "seed": self.seed,
+                        "parameter_point": "pre_task_training",
+                        "training_phase": "main_prompt_training",
+                        "old_gradient_objective": "old_task_seen_class_ce",
+                        "new_gradient_objective": (
+                            "actual_smope_masked_new_class_ce_plus_router_loss"
+                        ),
+                        "old_task": old_task_index + 1,
+                        "new_task": train_task_index + 1,
+                        "old_probe_samples": int(old_task["full"]["samples"]),
+                        "old_half_a_samples": int(old_task["half_a"]["samples"]),
+                        "old_half_b_samples": int(old_task["half_b"]["samples"]),
+                        "new_probe_samples": int(
+                            prepared["new_task"]["full"]["samples"]
+                        ),
+                        "new_half_a_samples": int(
+                            prepared["new_task"]["half_a"]["samples"]
+                        ),
+                        "new_half_b_samples": int(
+                            prepared["new_task"]["half_b"]["samples"]
+                        ),
+                        "layer": layer,
+                        "head": head,
+                        "expert": expert,
+                        "old_reference_hard_usage": old_usage,
+                        "new_pretraining_hard_usage": new_usage,
+                        "old_reference_soft_usage": (
+                            self.mechanism_reference_soft_usage[old_task_index].get(
+                                coordinate, 0.0
+                            )
+                        ),
+                        "new_pretraining_soft_usage": prepared[
+                            "new_pretraining_probe"
+                        ]["soft_usage"].get(coordinate, 0.0),
+                        "shared_hard_route": bool(
+                            old_usage > 0.0 and new_usage > 0.0
+                        ),
+                        "cross_task": cross_task,
+                        "same_old_task": same_old,
+                        "same_new_task": same_new,
+                        "same_task_control_negative_cosine": same_task_control,
+                        "excess_cross_task_conflict": excess_conflict,
+                        "actual_update": update_harm_metrics(
+                            old_full_combined,
+                            combined_update,
+                            epsilon=self.audit_mechanism_gradient_epsilon,
+                        ),
+                        "observed_full_model_old_loss_change": (
+                            observed_old_loss_change
+                        ),
+                        "key": component_records["key"],
+                        "value": component_records["value"],
+                    }
+                )
+        self._append_mechanism_records(
+            "expert_task_pair_conflict.jsonl.gz", records, compressed=True
+        )
+
+    def _mechanism_functional_probe(self, task_index):
+        model = self.learner.model
+        was_training = model.training
+        model.eval()
+        coordinates = set()
+        query_chunks = defaultdict(list)
+        usage_counts = {}
+        soft_usage_sums = {}
+        seen = 0
+        with torch.no_grad():
+            for inputs, _, _ in self._mechanism_probe_loader(task_index):
+                if self.learner.gpu:
+                    inputs = inputs.cuda()
+                layer_states = model(inputs, train=False, return_expert_state=True)
+                for layer, state in enumerate(layer_states):
+                    if state["response"] is None:
+                        continue
+                    query_chunks[layer].append(
+                        state["query"].detach().cpu().to(torch.float64)
+                    )
+                    indices = state["indices"].detach().cpu()
+                    router_probability = (
+                        state["router_probability"].detach().cpu().to(torch.float64)
+                    )
+                    for head in range(router_probability.size(1)):
+                        values, counts = torch.unique(
+                            indices[:, head].reshape(-1), return_counts=True
+                        )
+                        count_map = dict(zip(values.tolist(), counts.tolist()))
+                        for expert in range(router_probability.size(2)):
+                            coordinate = (layer, head, expert)
+                            coordinates.add(coordinate)
+                            usage_counts[coordinate] = usage_counts.get(
+                                coordinate, 0
+                            ) + int(count_map.get(expert, 0))
+                            soft_usage_sums[coordinate] = soft_usage_sums.get(
+                                coordinate, 0.0
+                            ) + float(router_probability[:, head, expert].sum())
+                seen += int(inputs.size(0))
+        model.train(was_training)
+        if seen == 0:
+            raise ValueError(f"Mechanism probe task {task_index + 1} has no samples.")
+        topk = int(self._audit_core_model().prompt.topk)
+        return {
+            "samples": seen,
+            "queries": {
+                layer: torch.cat(chunks, dim=0)
+                for layer, chunks in query_chunks.items()
+            },
+            "usage": {
+                coordinate: usage_counts.get(coordinate, 0) / (seen * topk)
+                for coordinate in coordinates
+            },
+            "usage_counts": usage_counts,
+            "soft_usage": {
+                coordinate: soft_usage_sums.get(coordinate, 0.0) / seen
+                for coordinate in coordinates
+            },
+        }
+
+    @staticmethod
+    def _mechanism_responses_from_fixed_queries(queries, parameters):
+        """Evaluate current expert K/V on task-boundary queries held fixed."""
+        by_layer_head = defaultdict(list)
+        for coordinate in parameters:
+            layer, head, expert = coordinate
+            by_layer_head[(layer, head)].append(expert)
+        responses = {}
+        for (layer, head), experts in sorted(by_layer_head.items()):
+            experts = sorted(experts)
+            query = queries[layer][:, head, :]
+            keys = torch.stack(
+                [parameters[(layer, head, expert)]["key"].reshape(-1) for expert in experts]
+            )
+            values = torch.stack(
+                [
+                    parameters[(layer, head, expert)]["value"].reshape(-1)
+                    for expert in experts
+                ]
+            )
+            probability = torch.softmax(query @ keys.t(), dim=-1)
+            weighted_values = probability.unsqueeze(-1) * values.unsqueeze(0)
+            for expert_position, expert in enumerate(experts):
+                responses[(layer, head, expert)] = weighted_values[
+                    :, expert_position, :
+                ].mean(dim=0)
+        return responses
+
+    def _snapshot_mechanism_parameters(self):
+        return {
+            coordinate: {
+                component: parameter.detach().cpu().to(torch.float64).clone()
+                for component, parameter in components.items()
+            }
+            for coordinate, components in self._mechanism_expert_parameters().items()
+        }
+
+    def _run_expert_interference_post_task(self, checkpoint_index):
+        current_parameters = self._snapshot_mechanism_parameters()
+        per_task_drifts = {}
+        usage_records = []
+        with self._preserve_rng_state():
+            for eval_task_index in range(checkpoint_index + 1):
+                probe = self._mechanism_functional_probe(eval_task_index)
+                if eval_task_index == checkpoint_index:
+                    self.mechanism_reference_queries[eval_task_index] = {
+                        layer: query.clone()
+                        for layer, query in probe["queries"].items()
+                    }
+                    boundary_responses = self._mechanism_responses_from_fixed_queries(
+                        self.mechanism_reference_queries[eval_task_index],
+                        current_parameters,
+                    )
+                    self.mechanism_reference_responses[eval_task_index] = {
+                        coordinate: value.clone()
+                        for coordinate, value in boundary_responses.items()
+                    }
+                    self.mechanism_reference_values[eval_task_index] = {
+                        coordinate: {
+                            component: value.clone()
+                            for component, value in components.items()
+                        }
+                        for coordinate, components in current_parameters.items()
+                    }
+                    self.mechanism_reference_usage[eval_task_index] = dict(
+                        probe["usage"]
+                    )
+                    self.mechanism_reference_soft_usage[eval_task_index] = dict(
+                        probe["soft_usage"]
+                    )
+                    for coordinate, usage_rate in sorted(probe["usage"].items()):
+                        layer, head, expert = coordinate
+                        usage_records.append(
+                            {
+                                "event": "expert_reference_usage",
+                                "schema_version": SCHEMA_VERSION,
+                                "repeat_id": self.round_id + 1,
+                                "seed": self.seed,
+                                "task": eval_task_index + 1,
+                                "layer": layer,
+                                "head": head,
+                                "expert": expert,
+                                "samples": probe["samples"],
+                                "topk": int(self._audit_core_model().prompt.topk),
+                                "usage_count": int(
+                                    probe["usage_counts"].get(coordinate, 0)
+                                ),
+                                "usage_rate": usage_rate,
+                                "soft_usage_mass": float(
+                                    probe["soft_usage"].get(coordinate, 0.0)
+                                ),
+                            }
+                        )
+
+                reference_responses = self.mechanism_reference_responses[
+                    eval_task_index
+                ]
+                reference_parameters = self.mechanism_reference_values[eval_task_index]
+                previous_responses = self.mechanism_previous_responses.get(
+                    eval_task_index, reference_responses
+                )
+                previous_parameters = (
+                    self.mechanism_previous_parameters
+                    if self.mechanism_previous_parameters is not None
+                    else reference_parameters
+                )
+                current_fixed_query_responses = (
+                    self._mechanism_responses_from_fixed_queries(
+                        self.mechanism_reference_queries[eval_task_index],
+                        current_parameters,
+                    )
+                )
+                per_task_drifts[eval_task_index] = {}
+                for coordinate, current_response in current_fixed_query_responses.items():
+                    cumulative_response_metrics = tensor_drift_metrics(
+                        current_response, reference_responses[coordinate]
+                    )
+                    incremental_response_metrics = tensor_drift_metrics(
+                        current_response, previous_responses[coordinate]
+                    )
+                    cumulative_key_metrics = tensor_drift_metrics(
+                        current_parameters[coordinate]["key"],
+                        reference_parameters[coordinate]["key"],
+                    )
+                    incremental_key_metrics = tensor_drift_metrics(
+                        current_parameters[coordinate]["key"],
+                        previous_parameters[coordinate]["key"],
+                    )
+                    cumulative_value_metrics = tensor_drift_metrics(
+                        current_parameters[coordinate]["value"],
+                        reference_parameters[coordinate]["value"],
+                    )
+                    incremental_value_metrics = tensor_drift_metrics(
+                        current_parameters[coordinate]["value"],
+                        previous_parameters[coordinate]["value"],
+                    )
+                    per_task_drifts[eval_task_index][coordinate] = {
+                        "samples": int(probe["samples"]),
+                        "topk": int(self._audit_core_model().prompt.topk),
+                        "current_usage_count": int(
+                            probe["usage_counts"].get(coordinate, 0)
+                        ),
+                        "reference_usage": self.mechanism_reference_usage[
+                            eval_task_index
+                        ].get(coordinate, 0.0),
+                        "current_usage": probe["usage"].get(coordinate, 0.0),
+                        "reference_soft_usage": self.mechanism_reference_soft_usage[
+                            eval_task_index
+                        ].get(coordinate, 0.0),
+                        "current_soft_usage": probe["soft_usage"].get(
+                            coordinate, 0.0
+                        ),
+                        "incremental_response_cosine_distance": (
+                            incremental_response_metrics["cosine_distance"]
+                        ),
+                        "incremental_response_relative_l2": (
+                            incremental_response_metrics["relative_l2"]
+                        ),
+                        "cumulative_response_cosine_distance": (
+                            cumulative_response_metrics["cosine_distance"]
+                        ),
+                        "cumulative_response_relative_l2": (
+                            cumulative_response_metrics["relative_l2"]
+                        ),
+                        "incremental_key_cosine_distance": (
+                            incremental_key_metrics["cosine_distance"]
+                        ),
+                        "cumulative_key_cosine_distance": (
+                            cumulative_key_metrics["cosine_distance"]
+                        ),
+                        "incremental_value_cosine_distance": (
+                            incremental_value_metrics["cosine_distance"]
+                        ),
+                        "cumulative_value_cosine_distance": (
+                            cumulative_value_metrics["cosine_distance"]
+                        ),
+                    }
+                self.mechanism_previous_responses[eval_task_index] = {
+                    coordinate: value.clone()
+                    for coordinate, value in current_fixed_query_responses.items()
+                }
+        self.mechanism_previous_parameters = {
+            coordinate: {
+                component: value.clone()
+                for component, value in components.items()
+            }
+            for coordinate, components in current_parameters.items()
+        }
+        self._append_mechanism_records(
+            "expert_usage.jsonl.gz", usage_records, compressed=True
+        )
+        self.mechanism_pending_drifts = per_task_drifts
+
+    def _write_mechanism_forgetting_and_drift(self, checkpoint_index, acc_table):
+        forgetting_records = []
+        for eval_task_index, accuracy in enumerate(acc_table):
+            history = self.mechanism_accuracy_history.setdefault(eval_task_index, [])
+            history.append(float(accuracy))
+            forgetting_records.append(
+                {
+                    "event": "task_forgetting",
+                    "schema_version": SCHEMA_VERSION,
+                    "repeat_id": self.round_id + 1,
+                    "seed": self.seed,
+                    "checkpoint_task": checkpoint_index + 1,
+                    "eval_task": eval_task_index + 1,
+                    "accuracy": float(accuracy),
+                    "learning_boundary_accuracy": float(history[0]),
+                    "learning_boundary_forgetting": float(history[0] - accuracy),
+                    "max_history_forgetting": float(max(history) - accuracy),
+                }
+            )
+        self._append_mechanism_records(
+            "task_forgetting.jsonl", forgetting_records
+        )
+
+        drift_records = []
+        for old_task_index, task_rows in self.mechanism_pending_drifts.items():
+            if old_task_index >= checkpoint_index:
+                continue
+            history = self.mechanism_accuracy_history[old_task_index]
+            learning_boundary_forgetting = float(
+                history[0] - acc_table[old_task_index]
+            )
+            max_history_forgetting = float(
+                max(history) - acc_table[old_task_index]
+            )
+            for coordinate, row in sorted(task_rows.items()):
+                layer, head, expert = coordinate
+                drift_records.append(
+                    {
+                        "event": "within_expert_task_pair_drift",
+                        "schema_version": SCHEMA_VERSION,
+                        "repeat_id": self.round_id + 1,
+                        "seed": self.seed,
+                        "old_task": old_task_index + 1,
+                        "new_task": checkpoint_index + 1,
+                        "layer": layer,
+                        "head": head,
+                        "expert": expert,
+                        "samples": row["samples"],
+                        "topk": row["topk"],
+                        "old_current_usage_count": row["current_usage_count"],
+                        "old_reference_hard_usage": row["reference_usage"],
+                        "old_current_hard_usage": row["current_usage"],
+                        "old_reference_soft_usage": row[
+                            "reference_soft_usage"
+                        ],
+                        "old_current_soft_usage": row["current_soft_usage"],
+                        "incremental_response_cosine_distance": row[
+                            "incremental_response_cosine_distance"
+                        ],
+                        "incremental_response_relative_l2": row[
+                            "incremental_response_relative_l2"
+                        ],
+                        "cumulative_response_cosine_distance": row[
+                            "cumulative_response_cosine_distance"
+                        ],
+                        "cumulative_response_relative_l2": row[
+                            "cumulative_response_relative_l2"
+                        ],
+                        "incremental_key_cosine_distance": row[
+                            "incremental_key_cosine_distance"
+                        ],
+                        "cumulative_key_cosine_distance": row[
+                            "cumulative_key_cosine_distance"
+                        ],
+                        "incremental_value_cosine_distance": row[
+                            "incremental_value_cosine_distance"
+                        ],
+                        "cumulative_value_cosine_distance": row[
+                            "cumulative_value_cosine_distance"
+                        ],
+                        "learning_boundary_forgetting": (
+                            learning_boundary_forgetting
+                        ),
+                        "max_history_forgetting": max_history_forgetting,
+                    }
+                )
+        self._append_mechanism_records(
+            "expert_functional_drift.jsonl.gz",
+            drift_records,
+            compressed=True,
+        )
+
     def train(self, avg_metrics):
 
         # temporary results saving
@@ -1305,9 +2127,24 @@ class Trainer:
                 main_gradient_audit = self._prepare_gradient_audit(
                     i, self.audit_gradient_components, include_routes=True
                 )
+            expert_task_pair_audit = None
+            if self.audit_expert_interference and i > 0:
+                print(
+                    "[expert-interference] preparing within-expert task-pair "
+                    f"gradients and split-half controls for task {i + 1}"
+                )
+                with self._preserve_rng_state():
+                    expert_task_pair_audit = self._prepare_expert_task_pair_audit(i)
             avg_train_time, re_train = self.learner.learn_batch(
                 train_loader, self.train_dataset, model_save_dir, test_loader
             )
+            if expert_task_pair_audit is not None:
+                print(
+                    "[expert-interference] matching task-pair conflict to the "
+                    f"actual task-{i + 1} parameter update"
+                )
+                with self._preserve_rng_state():
+                    self._write_expert_task_pair_audit(expert_task_pair_audit)
             if main_gradient_audit is not None:
                 self._write_gradient_audit(
                     i,
@@ -1344,6 +2181,13 @@ class Trainer:
             if self.audit_save_full_checkpoints:
                 self._save_full_audit_checkpoint(model_save_dir, i)
 
+            if self.audit_expert_interference:
+                print(
+                    "[expert-interference] measuring compact post-training "
+                    f"usage and functional drift at task {i + 1}"
+                )
+                self._run_expert_interference_post_task(i)
+
             if self.audit_router:
                 # Capture each task's own post-training route as the historical
                 # reference.  Later checkpoints replay these exact top-k choices.
@@ -1360,6 +2204,8 @@ class Trainer:
                 acc_table.append(
                     self.task_eval(j)
                 )  # eval each task one-by-one, after learning a new task; on train dataset
+            if self.audit_expert_interference:
+                self._write_mechanism_forgetting_and_drift(i, acc_table)
             temp_table["acc"].append(np.mean(np.asarray(acc_table)))
 
             # self.learner.model.prompt.print_freq()

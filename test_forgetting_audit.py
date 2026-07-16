@@ -8,6 +8,19 @@ from models.vit import Attention, VisionTransformer
 from trainer import Trainer
 from utils.audit_metrics import safe_recovery_ratio, vector_direction_metrics
 from utils.audit_state import temporary_state_updates
+from utils.analyze_expert_interference import (
+    build_final_checkpoint_usage_rows,
+    build_seed_endpoint_summary,
+    build_task_pair_summary,
+    build_usage_summaries,
+)
+from utils.expert_interference import (
+    gradient_conflict_summary,
+    gradient_pair_metrics,
+    stratified_probe_indices,
+    tensor_drift_metrics,
+    update_harm_metrics,
+)
 from utils.summarize_forgetting_audit import (
     build_accuracy_rows,
     build_condition_rows,
@@ -38,6 +51,231 @@ def test_historical_router_replay_accepts_exact_topk_indices():
         forced_indices=historical,
     )
     assert torch.allclose(automatic, replayed)
+
+
+def test_expert_state_probe_is_non_invasive_and_has_complete_pool():
+    torch.manual_seed(17)
+    attention = Attention(dim=8, num_heads=2, qkv_bias=True)
+    attention.eval()
+    inputs = torch.randn(3, 5, 8)
+    prompt = [
+        torch.randn(3, 2, 4, 4),
+        torch.randn(3, 2, 4, 4),
+        torch.zeros(2, 4),
+    ]
+    ordinary, ordinary_scores = attention(
+        inputs, prompt=prompt, topk=2, reduce_query=True
+    )
+    probed, probed_scores, expert_state = attention(
+        inputs,
+        prompt=prompt,
+        topk=2,
+        reduce_query=True,
+        return_expert_state=True,
+    )
+    assert torch.allclose(ordinary, probed)
+    assert torch.allclose(ordinary_scores[0], probed_scores[0])
+    assert expert_state["response"].shape == (3, 2, 4, 4)
+    assert expert_state["query"].shape == (3, 2, 4)
+    assert expert_state["indices"].shape == (3, 2, 1, 2)
+    assert expert_state["router_probability"].shape == (3, 2, 4)
+    assert torch.allclose(
+        expert_state["router_probability"].sum(dim=-1), torch.ones(3, 2)
+    )
+
+
+def test_gradient_conflict_excludes_inactive_pairs():
+    summary = gradient_conflict_summary(
+        [torch.tensor([0.0, 0.0]), torch.tensor([-1.0, 0.0])],
+        torch.tensor([1.0, 0.0]),
+    )
+    assert summary["old_task_pairs"] == 2
+    assert summary["valid_gradient_pairs"] == 1
+    assert summary["negative_pair_rate"] == 1.0
+    assert summary["mean_negative_cosine"] == 1.0
+
+
+def test_task_pair_conflict_and_update_harm_have_correct_signs():
+    conflict = gradient_pair_metrics(
+        torch.tensor([1.0, 0.0]), torch.tensor([-1.0, 0.0])
+    )
+    assert conflict["valid_gradient_pair"]
+    assert conflict["cosine"] == -1.0
+    assert conflict["negative_cosine"] == 1.0
+
+    harmful_update = update_harm_metrics(
+        torch.tensor([1.0, 0.0]), torch.tensor([0.25, 0.0])
+    )
+    assert harmful_update["first_order_old_loss_change"] == 0.25
+    assert harmful_update["predicted_harm"] == 0.25
+
+
+def test_same_task_split_half_control_can_remove_gradient_noise_baseline():
+    cross = gradient_pair_metrics(
+        torch.tensor([1.0, 0.0]), torch.tensor([-1.0, 0.0])
+    )
+    same_old = gradient_pair_metrics(
+        torch.tensor([1.0, 0.0]), torch.tensor([0.8, 0.2])
+    )
+    same_new = gradient_pair_metrics(
+        torch.tensor([-1.0, 0.0]), torch.tensor([-0.8, 0.2])
+    )
+    control = (same_old["negative_cosine"] + same_new["negative_cosine"]) / 2
+    assert control == 0.0
+    assert cross["negative_cosine"] - control == 1.0
+
+
+def test_stratified_probe_is_balanced_and_deterministic():
+    targets = [0] * 10 + [1] * 10 + [2] * 10
+    first = stratified_probe_indices(targets, 12, seed=9)
+    second = stratified_probe_indices(targets, 12, seed=9)
+    assert first == second
+    selected_targets = [targets[index] for index in first]
+    assert {class_id: selected_targets.count(class_id) for class_id in range(3)} == {
+        0: 4,
+        1: 4,
+        2: 4,
+    }
+
+
+def test_tensor_drift_reports_angular_and_relative_change():
+    metrics = tensor_drift_metrics(
+        torch.tensor([0.0, 1.0]), torch.tensor([1.0, 0.0])
+    )
+    assert abs(metrics["cosine_distance"] - 1.0) < 1e-12
+    assert abs(metrics["relative_l2"] - 2**0.5) < 1e-12
+
+
+def test_fixed_query_response_substitutes_only_current_expert_parameters():
+    queries = {0: torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]])}
+    parameters = {
+        (0, 0, 0): {
+            "key": torch.tensor([[1.0, 0.0]]),
+            "value": torch.tensor([[2.0, 0.0]]),
+        },
+        (0, 0, 1): {
+            "key": torch.tensor([[0.0, 1.0]]),
+            "value": torch.tensor([[0.0, 4.0]]),
+        },
+    }
+    responses = Trainer._mechanism_responses_from_fixed_queries(
+        queries, parameters
+    )
+    probability = torch.softmax(torch.tensor([[1.0, 0.0], [0.0, 1.0]]), dim=-1)
+    assert torch.allclose(
+        responses[(0, 0, 0)],
+        torch.tensor([2.0 * probability[:, 0].mean(), 0.0]),
+    )
+    assert torch.allclose(
+        responses[(0, 0, 1)],
+        torch.tensor([0.0, 4.0 * probability[:, 1].mean()]),
+    )
+
+
+def test_task_pair_analysis_uses_shared_experts_and_seed_level_pairs():
+    base = {
+        "repeat_id": 1,
+        "seed": 7,
+        "old_task": 1,
+        "new_task": 2,
+        "valid_cross_task_gradient": True,
+        "same_task_control_negative_cosine": 0.1,
+        "first_order_old_loss_change": 0.2,
+        "predicted_harm": 0.2,
+        "incremental_response_cosine_distance": 0.3,
+        "cumulative_response_cosine_distance": 0.4,
+        "observed_full_model_old_loss_change": 0.5,
+        "learning_boundary_forgetting": 0.6,
+        "max_history_forgetting": 0.7,
+    }
+    expert_rows = [
+        {
+            **base,
+            "shared_hard_route": True,
+            "cross_task_negative_cosine": 0.5,
+            "excess_cross_task_conflict": 0.4,
+        },
+        {
+            **base,
+            "shared_hard_route": False,
+            "cross_task_negative_cosine": 1.0,
+            "excess_cross_task_conflict": 0.9,
+        },
+    ]
+    task_pairs = build_task_pair_summary(expert_rows)
+    assert len(task_pairs) == 1
+    assert task_pairs[0]["shared_hard_route_units"] == 1
+    assert task_pairs[0]["median_excess_cross_task_conflict"] == 0.4
+    seed_rows = build_seed_endpoint_summary(task_pairs)
+    assert seed_rows[0]["task_pairs"] == 1
+    assert seed_rows[0]["primary_median_excess_conflict"] == 0.4
+
+
+def test_usage_summary_preserves_layer_head_expert_identity():
+    usage_rows = []
+    for task in (1, 2):
+        for layer, selected in ((0, {0, 1}), (1, {1, 2})):
+            for expert in (0, 1, 2):
+                usage_rows.append(
+                    {
+                        "repeat_id": 1,
+                        "seed": 9,
+                        "task": task,
+                        "layer": layer,
+                        "head": 0,
+                        "expert": expert,
+                        "samples": 10,
+                        "topk": 2,
+                        "usage_count": 10 if expert in selected else 0,
+                    }
+                )
+    coordinate_rows, pool_rows, overall_rows = build_usage_summaries(usage_rows)
+    assert len(coordinate_rows) == 6
+    assert len(pool_rows) == 2
+    assert all(row["exact_same_topk_all_tasks"] for row in pool_rows)
+    assert all(row["topk_selection_share"] == 1.0 for row in pool_rows)
+    assert overall_rows[0]["layer_head_pools"] == 2
+    assert overall_rows[0]["coordinate_experts"] == 6
+    assert sum(
+        row["global_coordinate_selection_share"] for row in coordinate_rows
+    ) == 1.0
+
+
+def test_final_checkpoint_usage_uses_old_task_drift_and_final_task_reference():
+    reference_rows = [
+        {
+            "repeat_id": 1,
+            "seed": 4,
+            "task": task,
+            "layer": 0,
+            "head": 0,
+            "expert": expert,
+            "samples": 10,
+            "topk": 1,
+            "usage_count": int(expert == task - 1) * 10,
+        }
+        for task in (1, 2)
+        for expert in (0, 1)
+    ]
+    drift_rows = [
+        {
+            "repeat_id": 1,
+            "seed": 4,
+            "old_task": 1,
+            "new_task": 2,
+            "layer": 0,
+            "head": 0,
+            "expert": expert,
+            "samples": 10,
+            "topk": 1,
+            "old_current_usage_count": int(expert == 1) * 10,
+        }
+        for expert in (0, 1)
+    ]
+    final_rows = build_final_checkpoint_usage_rows(reference_rows, drift_rows)
+    assert len(final_rows) == 4
+    task_one = {row["expert"]: row["usage_count"] for row in final_rows if row["task"] == 1}
+    assert task_one == {0: 0, 1: 10}
 
 
 def test_identity_logits_replay_matches_historical_forward_at_same_checkpoint():

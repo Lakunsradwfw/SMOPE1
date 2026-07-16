@@ -87,6 +87,7 @@ class Attention(nn.Module):
         reduce_query=False,
         forced_indices=None,
         forced_prompt_logits=None,
+        return_expert_state=False,
     ):
         B, N, C = x.shape
         qkv = (
@@ -103,6 +104,10 @@ class Attention(nn.Module):
         prompt_score_attn = None
         prompt_score_ = None
         prompt_score_label_ = None
+        expert_state = None
+        selected_indices = None
+        router_probability = None
+        expert_query = None
 
         if prompt is not None:
             if len(prompt) == 3:
@@ -129,6 +134,18 @@ class Attention(nn.Module):
                     -2, -1
                 )  # (B, num_heads, 1, num_prompt)
                 prompt_score_ = prompt_score_attn
+                if return_expert_state:
+                    # Preserve the natural hidden query.  The mechanism audit
+                    # freezes this task-conditioned query at the task learning
+                    # boundary and later substitutes only current expert K/V,
+                    # separating within-expert drift from upstream drift.
+                    expert_query = q_prompt.squeeze(-2)
+                    router_probability = torch.softmax(
+                        prompt_score_.squeeze(-2), dim=-1
+                    )
+                    expert_state = (
+                        router_probability.unsqueeze(-1) * pv
+                    )  # (B, heads, experts, head_dim)
 
                 attn = torch.cat(
                     [
@@ -186,6 +203,7 @@ class Attention(nn.Module):
                         "Historical router indices have shape "
                         f"{tuple(indices.shape)}, expected {expected}."
                     )
+            selected_indices = indices
             if forced_prompt_logits is not None and forced_indices is None:
                 raise ValueError(
                     "Historical prompt logits require historical router indices."
@@ -253,10 +271,15 @@ class Attention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
 
-        return x, (
-            prompt_score_,
-            prompt_score_label_,
-        )
+        prompt_scores = (prompt_score_, prompt_score_label_)
+        if return_expert_state:
+            return x, prompt_scores, {
+                "response": expert_state,
+                "query": expert_query,
+                "indices": selected_indices,
+                "router_probability": router_probability,
+            }
+        return x, prompt_scores
 
 
 class Block(nn.Module):
@@ -304,10 +327,11 @@ class Block(nn.Module):
         reduce_query=False,
         forced_indices=None,
         forced_prompt_logits=None,
+        return_expert_state=False,
     ):
         h = x
         x = self.norm1(x)
-        x, prompt_scores = self.attn(
+        attention_output = self.attn(
             x,
             register_hook=register_hook,
             prompt=prompt,
@@ -316,7 +340,12 @@ class Block(nn.Module):
             reduce_query=reduce_query,
             forced_indices=forced_indices,
             forced_prompt_logits=forced_prompt_logits,
+            return_expert_state=return_expert_state,
         )
+        if return_expert_state:
+            x, prompt_scores, expert_state = attention_output
+        else:
+            x, prompt_scores = attention_output
         x = h + self.drop_path(x)
 
         h = x
@@ -324,6 +353,8 @@ class Block(nn.Module):
         x = self.mlp(x)
         x = h + self.drop_path(x)
 
+        if return_expert_state:
+            return x, prompt_scores, expert_state
         return x, prompt_scores
 
 
@@ -441,6 +472,7 @@ class VisionTransformer(nn.Module):
         reduce_query=False,
         forced_prompt_indices=None,
         forced_prompt_logits=None,
+        return_expert_state=False,
     ):
         B = x.shape[0]
         x = self.patch_embed(x)
@@ -456,6 +488,7 @@ class VisionTransformer(nn.Module):
         prompt_loss = x.new_zeros((1,))
 
         prompt_scores = []
+        expert_states = []
 
         for i, blk in enumerate(self.blocks):
 
@@ -470,7 +503,7 @@ class VisionTransformer(nn.Module):
             else:
                 p_list = None
 
-            x, prompt_score = blk(
+            block_output = blk(
                 x,
                 register_blk == i,
                 prompt=p_list,
@@ -487,11 +520,20 @@ class VisionTransformer(nn.Module):
                     if forced_prompt_logits is not None
                     else None
                 ),
+                return_expert_state=return_expert_state,
             )
+            if return_expert_state:
+                x, prompt_score, expert_state = block_output
+                expert_states.append(expert_state)
+            else:
+                x, prompt_score = block_output
             prompt_scores.append(prompt_score)
 
         if return_attn:
             return prompt_scores
+
+        if return_expert_state:
+            return expert_states
 
         if train and reduce_query:
             router_loss = prompt.router_loss(prompt_scores, task_id, topk)

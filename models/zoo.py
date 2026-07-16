@@ -791,6 +791,7 @@ class ViTZoo(nn.Module):
         dense=False,
         forced_prompt_indices=None,
         forced_prompt_logits=None,
+        return_expert_state=False,
     ):
 
         reduce_query = False
@@ -824,6 +825,20 @@ class ViTZoo(nn.Module):
                     forced_prompt_logits=forced_prompt_logits,
                 )
                 return prompt_scores
+
+            if return_expert_state:
+                return self.feat(
+                    x,
+                    prompt=self.prompt,
+                    q=q,
+                    train=False,
+                    task_id=self.task_id,
+                    topk=topk,
+                    reduce_query=reduce_query,
+                    forced_prompt_indices=forced_prompt_indices,
+                    forced_prompt_logits=forced_prompt_logits,
+                    return_expert_state=True,
+                )
 
             out, prompt_loss, pre_logits = self.feat(
                 x,

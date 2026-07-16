@@ -20,6 +20,7 @@ AUDIT_EXPERT_USAGE=${AUDIT_EXPERT_USAGE:-1}
 AUDIT_GRADIENT_DIRECTION=${AUDIT_GRADIENT_DIRECTION:-0}
 AUDIT_SAVE_FULL_CHECKPOINTS=${AUDIT_SAVE_FULL_CHECKPOINTS:-1}
 AUDIT_SAMPLE_MANIFEST=${AUDIT_SAMPLE_MANIFEST:-}
+AUDIT_MAIN_EPOCHS=${AUDIT_MAIN_EPOCHS:-0}
 
 read -r -a SEED_ARRAY <<< "${SEEDS}"
 read -r -a CHECKPOINT_ARRAY <<< "${AUDIT_CHECKPOINTS}"
@@ -40,6 +41,7 @@ python -u run.py \
   --learner_type prompt --learner_name OnePrompt \
   --prompt_param 50 5 1e-5 1e-5 0.4 --seeds "${SEED_ARRAY[@]}" \
   --max_task "${MAX_TASK}" --crct_epochs "${CRCT_EPOCHS}" --ca_batch_size_ratio 1 \
+  --audit_main_epochs "${AUDIT_MAIN_EPOCHS}" \
   --audit_router --audit_checkpoints "${CHECKPOINT_ARRAY[@]}" \
   --audit_router_replay_modes identity identity_prompt_logits \
   --audit_router_max_samples "${AUDIT_MAX_SAMPLES}" \

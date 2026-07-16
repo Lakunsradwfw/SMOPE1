@@ -139,11 +139,12 @@ def create_args():
     )
     parser.add_argument(
         "--audit_freeze_component",
-        choices=["none", "prompt", "key", "value", "classifier"],
+        choices=["none", "prompt", "key", "value", "key_value", "classifier"],
         default="none",
         help=(
             "component held fixed from --audit_freeze_from_task onward; "
-            "classifier freezes old-class rows while allowing new rows to learn"
+            "key_value freezes both e_pk and e_pv; classifier freezes old-class "
+            "rows while allowing new rows to learn"
         ),
     )
     parser.add_argument(
@@ -157,6 +158,15 @@ def create_args():
         type=int,
         default=0,
         help="1-based last frozen task; 0 keeps the component frozen to the end",
+    )
+    parser.add_argument(
+        "--audit_main_epochs",
+        type=int,
+        default=0,
+        help=(
+            "matched-plasticity control for OnePrompt main training; a positive "
+            "value replaces schedule[-1], while 0 preserves the configured epochs"
+        ),
     )
     parser.add_argument(
         "--audit_expert_usage",

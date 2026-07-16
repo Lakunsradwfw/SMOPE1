@@ -6,7 +6,7 @@ schedule:
 - 0
 - 1
 schedule_type: coswm
-batch_size: 8
+batch_size: 128
 optimizer: AdamW
 lr: 0.005
 momentum: 0.9
@@ -16,7 +16,7 @@ model_type: zoo
 model_name: vit_pt_imnet
 max_task: -1
 dataroot: data
-workers: 0
+workers: 4
 validation: False
 train_aug: True
 rand_split: True

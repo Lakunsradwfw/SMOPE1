@@ -187,6 +187,10 @@ class OnePrompt(Prompt):
                 component == "prompt"
                 or (component == "key" and "e_pk_" in name)
                 or (component == "value" and "e_pv_" in name)
+                or (
+                    component == "key_value"
+                    and ("e_pk_" in name or "e_pv_" in name)
+                )
             )
             if selected:
                 parameter.requires_grad_(trainable)
@@ -199,7 +203,7 @@ class OnePrompt(Prompt):
         if not self._audit_freeze_active():
             return
         component = self.config.get("audit_freeze_component", "none")
-        if component in {"prompt", "key", "value"}:
+        if component in {"prompt", "key", "value", "key_value"}:
             self._set_audit_component_trainable(component, False)
 
     def _keep_prompt_parameter(self, name):
@@ -212,7 +216,15 @@ class OnePrompt(Prompt):
             return "e_pk_" not in name
         if component == "value":
             return "e_pv_" not in name
+        if component == "key_value":
+            return "e_pk_" not in name and "e_pv_" not in name
         return True
+
+    def _audit_main_epoch_count(self, epoch_factor=1):
+        configured = int(self.config["schedule"][-1])
+        override = int(self.config.get("audit_main_epochs", 0))
+        base_epochs = override if override > 0 else configured
+        return max(1, int(base_epochs * epoch_factor))
 
     def init_optimizer(self, epoch_factor=1):
 
@@ -275,7 +287,7 @@ class OnePrompt(Prompt):
 
         # create optimizers
         self.optimizer = torch.optim.__dict__[self.config["optimizer"]](optimizer_arg)
-        num_epochs = int(self.config["schedule"][-1] * epoch_factor)
+        num_epochs = self._audit_main_epoch_count(epoch_factor)
 
         # create schedules
         if self.schedule_type == "cosine":
@@ -348,7 +360,7 @@ class OnePrompt(Prompt):
         acc = AverageMeter()
 
         batch_timer = Timer()
-        num_epochs = int(self.config["schedule"][-1] * epoch_factor)
+        num_epochs = self._audit_main_epoch_count(epoch_factor)
 
         if self.schedule_type == "coswm":  # step scheduler at each iter
             for epoch in range(num_epochs):

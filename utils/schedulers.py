@@ -137,8 +137,11 @@ class CosineSchedulerIter(_LRSchedulerIter):
         start_warmup_value=0,
         freeze_iters=0,
     ):
-        super().__init__(optimizer, iter_step, n_epochs, last_epoch)
+        # The base initializer calls ``step`` immediately.  In a zero-epoch
+        # schedule (used by the initial half-epoch smoke-test phase), that
+        # reaches ``get_lr``'s terminal branch, which needs ``final_value``.
         self.final_value = final_value
+        super().__init__(optimizer, iter_step, n_epochs, last_epoch)
         warmup_iters = warmup_epochs * iter_step
 
         n_groups = len(self.optimizer.param_groups)

@@ -117,6 +117,51 @@ def test_freeze_filters_key_and_value_independently():
     assert learner._keep_prompt_parameter("e_pk_0_0_0")
     assert not learner._keep_prompt_parameter("e_pv_0_0_0")
 
+    learner.config["audit_freeze_component"] = "key_value"
+    assert not learner._keep_prompt_parameter("e_pk_0_0_0")
+    assert not learner._keep_prompt_parameter("e_pv_0_0_0")
+
+
+def test_key_value_freeze_sets_both_requires_grad_false():
+    class TinyPrompt(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.e_pk_0_0_0 = nn.Parameter(torch.ones(1))
+            self.e_pv_0_0_0 = nn.Parameter(torch.ones(1))
+            self.other = nn.Parameter(torch.ones(1))
+
+    class TinyCore(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.prompt = TinyPrompt()
+
+    learner = object.__new__(OnePromptLearner)
+    nn.Module.__init__(learner)
+    learner.model = TinyCore()
+    learner.task_count = 1
+    learner.config = {
+        "audit_freeze_component": "key_value",
+        "audit_freeze_from_task": 2,
+        "audit_freeze_until_task": 0,
+    }
+    learner._configure_audit_freeze_for_current_task()
+    assert not learner.model.prompt.e_pk_0_0_0.requires_grad
+    assert not learner.model.prompt.e_pv_0_0_0.requires_grad
+    assert learner.model.prompt.other.requires_grad
+    learner.model.prompt.other.sum().backward()
+    assert learner.model.prompt.e_pk_0_0_0.grad is None
+    assert learner.model.prompt.e_pv_0_0_0.grad is None
+
+
+def test_audit_main_epochs_preserves_default_and_supports_override():
+    learner = object.__new__(OnePromptLearner)
+    learner.config = {"schedule": [80, 0, 20], "audit_main_epochs": 0}
+    assert learner._audit_main_epoch_count() == 20
+    assert learner._audit_main_epoch_count(epoch_factor=0.5) == 10
+    learner.config["audit_main_epochs"] = 17
+    assert learner._audit_main_epoch_count() == 17
+    assert learner._audit_main_epoch_count(epoch_factor=0.5) == 8
+
 
 def test_key_freeze_sets_requires_grad_false_and_grad_stays_none():
     class TinyPrompt(nn.Module):

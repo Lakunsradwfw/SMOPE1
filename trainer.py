@@ -184,6 +184,7 @@ class Trainer:
             "audit_freeze_component": args.audit_freeze_component,
             "audit_freeze_from_task": args.audit_freeze_from_task,
             "audit_freeze_until_task": args.audit_freeze_until_task,
+            "audit_main_epochs": args.audit_main_epochs,
         }
         self.learner_type, self.learner_name = args.learner_type, args.learner_name
         self.learner = learners.__dict__[self.learner_type].__dict__[self.learner_name](

@@ -395,21 +395,21 @@ class OnePrompt(Prompt):
                 self.log("Optimizer is reset!")
                 epoch_factor = 0.5
                 self.init_optimizer(epoch_factor=epoch_factor)
-                with self.stage_timer.measure("main_training"):
+                with self.stage_timer.measure("dense_initialization"):
                     self.learn_prompt(
                         train_loader, batch_time, dense=True, epoch_factor=epoch_factor
                     )
                 self.log("Optimizer is reset!")
                 self.init_optimizer()
 
-            with self.stage_timer.measure("main_training"):
+            with self.stage_timer.measure("routed_training"):
                 self.learn_prompt(train_loader, batch_time)
 
             print("-" * 10)
             print("Selecting Experts...")
             num_samples = 0
 
-            with self.stage_timer.measure("expert_selection"):
+            with self.stage_timer.measure("expert_frequency_scan"):
                 for i, (x, y, task) in enumerate(train_loader):
                     # verify in train mode
                     self.model.eval()

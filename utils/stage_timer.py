@@ -10,8 +10,18 @@ class StageTimer:
 
     STAGES = OrderedDict(
         [
-            ("main_training", "Main training"),
-            ("expert_selection", "Expert selection"),
+            (
+                "dense_initialization",
+                "Dense initialization training (no Top-K routing)",
+            ),
+            (
+                "routed_training",
+                "Routed training (fwd+bwd + online Top-K experts)",
+            ),
+            (
+                "expert_frequency_scan",
+                "Post-training expert-frequency scan",
+            ),
             ("prototype_statistics", "Prototype statistics (_compute_mean)"),
             ("prototype_replay", "Prototype replay training (crct)"),
             ("task_evaluation", "Task evaluation (task_eval)"),
@@ -50,7 +60,7 @@ class StageTimer:
             title += " for trial {}".format(trial_id)
         print(title + " ===")
         print(
-            "{:<42} {:>12} {:>10} {:>10} {:>8}".format(
+            "{:<56} {:>12} {:>10} {:>10} {:>8}".format(
                 "Stage", "Seconds", "Measured%", "Trial%", "Calls"
             )
         )
@@ -60,7 +70,7 @@ class StageTimer:
             measured_pct = 100.0 * seconds / measured_time if measured_time else 0.0
             trial_pct = 100.0 * seconds / trial_time if trial_time else 0.0
             print(
-                "{:<42} {:>12.2f} {:>9.2f}% {:>9.2f}% {:>8d}".format(
+                "{:<56} {:>12.2f} {:>9.2f}% {:>9.2f}% {:>8d}".format(
                     label,
                     seconds,
                     measured_pct,
@@ -69,7 +79,7 @@ class StageTimer:
                 )
             )
 
-        print("-" * 88)
+        print("-" * 102)
         print("Measured stages total: {:.2f}s".format(measured_time))
         if trial_time is not None:
             other_time = max(0.0, trial_time - measured_time)
@@ -81,3 +91,25 @@ class StageTimer:
             )
             print("Trial wall-clock total: {:.2f}s".format(trial_time))
 
+        routed_time = self.elapsed["routed_training"]
+        dense_time = self.elapsed["dense_initialization"]
+        optimization_time = dense_time + routed_time
+        routed_trial_pct = 100.0 * routed_time / trial_time if trial_time else 0.0
+        optimization_trial_pct = (
+            100.0 * optimization_time / trial_time if trial_time else 0.0
+        )
+        print("=== Requested routing-training timing ===")
+        print(
+            "Routed training only (includes online Top-K routing/expert selection): "
+            "{:.2f}s ({:.2f}% of trial)".format(routed_time, routed_trial_pct)
+        )
+        print(
+            "SMoPE optimization total (dense initialization + routed training): "
+            "{:.2f}s ({:.2f}% of trial)".format(
+                optimization_time, optimization_trial_pct
+            )
+        )
+        print(
+            "Post-training expert-frequency scan is auxiliary statistics and is "
+            "excluded from routed training."
+        )

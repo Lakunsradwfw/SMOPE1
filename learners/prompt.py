@@ -14,12 +14,14 @@ from .default import NormalNN, weight_reset, accumulate_acc
 import copy
 import torchvision
 from utils.schedulers import CosineSchedule, CosineSchedulerIter
+from utils.stage_timer import StageTimer
 from torch.autograd import Variable, Function
 
 
 class Prompt(NormalNN):
     def __init__(self, learner_config):
         self.prompt_param = learner_config["prompt_param"]
+        self.stage_timer = learner_config.get("stage_timer") or StageTimer()
         super(Prompt, self).__init__(learner_config)
 
     def update_model(self, inputs, targets):
@@ -393,31 +395,34 @@ class OnePrompt(Prompt):
                 self.log("Optimizer is reset!")
                 epoch_factor = 0.5
                 self.init_optimizer(epoch_factor=epoch_factor)
-                self.learn_prompt(
-                    train_loader, batch_time, dense=True, epoch_factor=epoch_factor
-                )
+                with self.stage_timer.measure("main_training"):
+                    self.learn_prompt(
+                        train_loader, batch_time, dense=True, epoch_factor=epoch_factor
+                    )
                 self.log("Optimizer is reset!")
                 self.init_optimizer()
 
-            self.learn_prompt(train_loader, batch_time)
+            with self.stage_timer.measure("main_training"):
+                self.learn_prompt(train_loader, batch_time)
 
             print("-" * 10)
             print("Selecting Experts...")
             num_samples = 0
 
-            for i, (x, y, task) in enumerate(train_loader):
-                # verify in train mode
-                self.model.eval()
-                # send data to gpu
-                if self.gpu:
-                    x = x.cuda()
-                    y = y.cuda()
+            with self.stage_timer.measure("expert_selection"):
+                for i, (x, y, task) in enumerate(train_loader):
+                    # verify in train mode
+                    self.model.eval()
+                    # send data to gpu
+                    if self.gpu:
+                        x = x.cuda()
+                        y = y.cuda()
 
-                with torch.no_grad():
-                    prompt_scores = self.model(x, train=False, return_attn=True)
+                    with torch.no_grad():
+                        prompt_scores = self.model(x, train=False, return_attn=True)
 
-                self.model.prompt.update_prompt(prompt_scores)
-                num_samples += x.size(0)
+                    self.model.prompt.update_prompt(prompt_scores)
+                    num_samples += x.size(0)
 
             self.model.prompt.update_num_samples(num_samples)
             # self.model.prompt.print_freq()

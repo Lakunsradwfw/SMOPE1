@@ -284,6 +284,7 @@ if __name__ == "__main__":
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
         print(f"=== Total time: {total_time_str} ===")
+        trainer.stage_timer.print_report(trial_time=total_time, trial_id=r + 1)
 
         # save results
         for mkey in metric_keys:

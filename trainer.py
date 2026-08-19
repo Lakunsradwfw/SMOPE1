@@ -17,6 +17,7 @@ from typing import Iterable
 import learners
 from utils import utils_tap
 from utils.schedulers import CosineSchedulerIter
+from utils.stage_timer import StageTimer
 
 
 class Trainer:
@@ -30,6 +31,7 @@ class Trainer:
         self.log_dir = args.log_dir
         self.batch_size = args.batch_size
         self.workers = args.workers
+        self.stage_timer = StageTimer()
 
         # model load directory
         self.model_top_dir = args.log_dir
@@ -158,6 +160,7 @@ class Trainer:
             "top_k": self.top_k,
             "prompt_param": [self.num_tasks, args.prompt_param],
             "pretrained_weight": args.pretrained_weight,
+            "stage_timer": self.stage_timer,
         }
         self.learner_type, self.learner_name = args.learner_type, args.learner_name
         self.learner = learners.__dict__[self.learner_type].__dict__[self.learner_name](
@@ -179,6 +182,11 @@ class Trainer:
         self.ca_batch_size_ratio = args.ca_batch_size_ratio
 
     def task_eval(self, t_index, local=False, task="acc"):
+
+        with self.stage_timer.measure("task_evaluation"):
+            return self._task_eval(t_index, local=local, task=task)
+
+    def _task_eval(self, t_index, local=False, task="acc"):
 
         val_name = self.task_names[t_index]
         print(f"validation split name (local {local}):", val_name)
@@ -445,6 +453,11 @@ class Trainer:
 
     @torch.no_grad()
     def _compute_mean(self, model: torch.nn.Module, class_mask=None):
+        with self.stage_timer.measure("prototype_statistics"):
+            return self._compute_mean_impl(model=model, class_mask=class_mask)
+
+    @torch.no_grad()
+    def _compute_mean_impl(self, model: torch.nn.Module, class_mask=None):
         model.eval()
 
         for cls_id in class_mask:
@@ -502,6 +515,14 @@ class Trainer:
                 raise NotImplementedError
 
     def train_task_adaptive_prediction(
+        self, model: torch.nn.Module, class_mask=None, task_id=-1
+    ):
+        with self.stage_timer.measure("prototype_replay"):
+            return self._train_task_adaptive_prediction_impl(
+                model=model, class_mask=class_mask, task_id=task_id
+            )
+
+    def _train_task_adaptive_prediction_impl(
         self, model: torch.nn.Module, class_mask=None, task_id=-1
     ):
         model.train()

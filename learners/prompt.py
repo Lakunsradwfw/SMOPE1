@@ -22,6 +22,7 @@ class Prompt(NormalNN):
     def __init__(self, learner_config):
         self.prompt_param = learner_config["prompt_param"]
         self.stage_timer = learner_config.get("stage_timer") or StageTimer()
+        self.flops_profiler = learner_config.get("flops_profiler")
         super(Prompt, self).__init__(learner_config)
 
     def update_model(self, inputs, targets):
@@ -168,6 +169,7 @@ class OnePrompt(Prompt):
             prompt_flag="smope",
             prompt_param=self.prompt_param,
             pretrained=cfg["pretrained_weight"],
+            smope_mode=cfg.get("smope_mode", "baseline"),
         )  # vit_pt_imnet
         return model
 
@@ -283,7 +285,15 @@ class OnePrompt(Prompt):
                         y = y.cuda()
 
                     # model update
-                    loss, output = self.update_model(x, y, dense=dense)
+                    profile_name = "routed_train" if not dense and self.task_count > 0 else None
+                    if profile_name is None:
+                        loss, output = self.update_model(x, y, dense=dense)
+                    else:
+                        with self.flops_profiler.profile_once(profile_name, x.size(0)):
+                            loss, output = self.update_model(x, y, dense=dense)
+                    self.stage_timer.add_samples(
+                        "dense_initialization" if dense else "routed_training", x.size(0)
+                    )
                     self.scheduler.step()
 
                     # measure elapsed time
@@ -334,7 +344,15 @@ class OnePrompt(Prompt):
                         y = y.cuda()
 
                     # model update
-                    loss, output = self.update_model(x, y, dense=dense)
+                    profile_name = "routed_train" if not dense and self.task_count > 0 else None
+                    if profile_name is None:
+                        loss, output = self.update_model(x, y, dense=dense)
+                    else:
+                        with self.flops_profiler.profile_once(profile_name, x.size(0)):
+                            loss, output = self.update_model(x, y, dense=dense)
+                    self.stage_timer.add_samples(
+                        "dense_initialization" if dense else "routed_training", x.size(0)
+                    )
 
                     # measure elapsed time
                     batch_time.update(batch_timer.toc())
@@ -409,22 +427,27 @@ class OnePrompt(Prompt):
             print("Selecting Experts...")
             num_samples = 0
 
-            with self.stage_timer.measure("expert_frequency_scan"):
-                for i, (x, y, task) in enumerate(train_loader):
-                    # verify in train mode
-                    self.model.eval()
-                    # send data to gpu
-                    if self.gpu:
-                        x = x.cuda()
-                        y = y.cuda()
+            needs_frequency_scan = not self.model.prompt.static_routes_enabled()
+            if needs_frequency_scan:
+                with self.stage_timer.measure("expert_frequency_scan"):
+                    for i, (x, y, task) in enumerate(train_loader):
+                        # verify in train mode
+                        self.model.eval()
+                        # send data to gpu
+                        if self.gpu:
+                            x = x.cuda()
+                            y = y.cuda()
 
-                    with torch.no_grad():
-                        prompt_scores = self.model(x, train=False, return_attn=True)
+                        with torch.no_grad():
+                            prompt_scores = self.model(x, train=False, return_attn=True)
 
-                    self.model.prompt.update_prompt(prompt_scores)
-                    num_samples += x.size(0)
+                        self.model.prompt.update_prompt(prompt_scores)
+                        num_samples += x.size(0)
+                        self.stage_timer.add_samples("expert_frequency_scan", x.size(0))
 
-            self.model.prompt.update_num_samples(num_samples)
+                self.model.prompt.update_num_samples(num_samples)
+                if self.task_count == 0:
+                    self.model.prompt.freeze_routes()
             # self.model.prompt.print_freq()
             print("-" * 10)
 

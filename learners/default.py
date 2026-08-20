@@ -31,6 +31,8 @@ class NormalNN(nn.Module):
         self.batch_size = learner_config["batch_size"]
         self.tasks = learner_config["tasks"]
         self.top_k = learner_config["top_k"]
+        self.stage_timer = learner_config.get("stage_timer")
+        self.flops_profiler = learner_config.get("flops_profiler")
 
         # replay memory parameters
         self.memory_size = self.config["memory"]
@@ -264,8 +266,10 @@ class NormalNN(nn.Module):
                     target = target.cuda()
             if task_in is None:
                 # Add torch.no_grad to save memory
-                with torch.no_grad():
-                    output = model.forward(input)[:, : self.valid_out_dim]
+                with self.stage_timer.measure("inference_forward", samples=input.size(0)):
+                    with self.flops_profiler.profile_once("inference", input.size(0)):
+                        with torch.no_grad():
+                            output = model.forward(input)[:, : self.valid_out_dim]
                 # output = model.forward(input)[:, :self.valid_out_dim]
                 # TODO: try other task_metric?
                 acc = accumulate_acc(output, target, task, acc, topk=(self.top_k,))
@@ -289,8 +293,10 @@ class NormalNN(nn.Module):
                 if len(target) > 1:
                     if task_global:
                         # Add torch.no_grad to save memory
-                        with torch.no_grad():
-                            output = model.forward(input)[:, : self.valid_out_dim]
+                        with self.stage_timer.measure("inference_forward", samples=input.size(0)):
+                            with self.flops_profiler.profile_once("inference", input.size(0)):
+                                with torch.no_grad():
+                                    output = model.forward(input)[:, : self.valid_out_dim]
                         # output = model.forward(input)[:, :self.valid_out_dim]
                         # TODO: try other task_metric?
                         acc = accumulate_acc(
@@ -298,8 +304,10 @@ class NormalNN(nn.Module):
                         )
                     else:
                         # Add torch.no_grad to save memory
-                        with torch.no_grad():
-                            output = model.forward(input)[:, task_in]
+                        with self.stage_timer.measure("inference_forward", samples=input.size(0)):
+                            with self.flops_profiler.profile_once("inference", input.size(0)):
+                                with torch.no_grad():
+                                    output = model.forward(input)[:, task_in]
                         # output = model.forward(input)[:, task_in]
                         # TODO: try other task_metric?
                         acc = accumulate_acc(
@@ -339,6 +347,10 @@ class NormalNN(nn.Module):
     def load_model(self, filename):
         state_dict = torch.load(filename + "class.pth")
         self.model.load_state_dict(state_dict)
+        if getattr(self.model, "prompt", None) is not None and hasattr(
+            self.model.prompt, "sync_static_route_state"
+        ):
+            self.model.prompt.sync_static_route_state()
         # self.model.load_state_dict(torch.load(filename + 'class.pth'))
         self.log("=> Load Done from {}".format(filename))
         if self.gpu:

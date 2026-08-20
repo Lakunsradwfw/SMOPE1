@@ -18,6 +18,7 @@ import learners
 from utils import utils_tap
 from utils.schedulers import CosineSchedulerIter
 from utils.stage_timer import StageTimer
+from utils.efficiency import FlopsProfiler
 
 
 class Trainer:
@@ -32,6 +33,8 @@ class Trainer:
         self.batch_size = args.batch_size
         self.workers = args.workers
         self.stage_timer = StageTimer()
+        self.flops_profiler = FlopsProfiler(enabled=args.profile_flops)
+        self.evaluation_phase = "intermediate"
 
         # model load directory
         self.model_top_dir = args.log_dir
@@ -161,6 +164,8 @@ class Trainer:
             "prompt_param": [self.num_tasks, args.prompt_param],
             "pretrained_weight": args.pretrained_weight,
             "stage_timer": self.stage_timer,
+            "flops_profiler": self.flops_profiler,
+            "smope_mode": args.smope_mode,
         }
         self.learner_type, self.learner_name = args.learner_type, args.learner_name
         self.learner = learners.__dict__[self.learner_type].__dict__[self.learner_name](
@@ -182,8 +187,8 @@ class Trainer:
         self.ca_batch_size_ratio = args.ca_batch_size_ratio
 
     def task_eval(self, t_index, local=False, task="acc"):
-
-        with self.stage_timer.measure("task_evaluation"):
+        stage = "{}_evaluation".format(self.evaluation_phase)
+        with self.stage_timer.measure(stage):
             return self._task_eval(t_index, local=local, task=task)
 
     def _task_eval(self, t_index, local=False, task="acc"):
@@ -385,7 +390,7 @@ class Trainer:
         return {"global": avg_fr_all}
 
     def evaluate(self, avg_metrics):
-
+        self.evaluation_phase = "final"
         self.learner = learners.__dict__[self.learner_type].__dict__[self.learner_name](
             self.learner_config
         )

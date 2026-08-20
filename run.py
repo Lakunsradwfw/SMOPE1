@@ -13,6 +13,23 @@ import random, pdb
 import pandas as pd
 from openpyxl import load_workbook
 from trainer import Trainer
+from utils.efficiency import write_efficiency_records
+from utils.stage_timer import StageTimer
+
+
+def remove_profiler_overhead(total_seconds, total_samples, profile_record):
+    """Estimate timing without one-off profiler instrumentation overhead."""
+    if not profile_record or not total_samples:
+        return total_seconds, 0.0
+    profile_samples = profile_record.get("samples", 0)
+    profile_wall = profile_record.get("profiled_wall_seconds", 0.0)
+    unprofiled_samples = total_samples - profile_samples
+    unprofiled_seconds = max(0.0, total_seconds - profile_wall)
+    if unprofiled_samples <= 0:
+        return total_seconds, 0.0
+    expected_batch_seconds = unprofiled_seconds * profile_samples / unprofiled_samples
+    overhead = max(0.0, profile_wall - expected_batch_seconds)
+    return max(0.0, total_seconds - overhead), overhead
 
 
 def create_args():
@@ -138,6 +155,17 @@ def create_args():
     parser.add_argument(
         "--pretrained_weight", type=str, default="sup1k", help="load pretrained weight"
     )
+    parser.add_argument(
+        "--smope_mode",
+        choices=["baseline", "static_route"],
+        default="baseline",
+        help="Original dynamic SMoPE or task-1 compiled static routes",
+    )
+    parser.add_argument(
+        "--profile_flops",
+        action="store_true",
+        help="Profile one steady-state routed train batch and one inference batch",
+    )
 
     # Config Arg
     parser.add_argument(
@@ -194,6 +222,7 @@ if __name__ == "__main__":
     save_keys = ["global", "pt"]
     global_only = ["time", "fr"]
     avg_metrics = {}
+    efficiency_records = []
     for mkey in metric_keys:
         avg_metrics[mkey] = {}
         for skey in save_keys:
@@ -240,7 +269,7 @@ if __name__ == "__main__":
             start_r = 0
 
     for r in range(0, args.repeat):
-        start_time = time.time()
+        trial_start = StageTimer.wall_time()
         print("************************************")
         print("* STARTING TRIAL " + str(r + 1))
         print("************************************")
@@ -273,18 +302,92 @@ if __name__ == "__main__":
                         (max_task, max_task, args.repeat)
                     )
 
-        # train model
+        # Train timing includes every continual-learning task and method-specific
+        # overhead. Intermediate evaluation is measured independently and removed
+        # from the CL-train metric below.
+        train_phase_start = StageTimer.wall_time()
         avg_metrics = trainer.train(avg_metrics)
+        train_phase_seconds = StageTimer.wall_time() - train_phase_start
 
         # evaluate model
+        final_eval_start = StageTimer.wall_time()
         avg_metrics = trainer.evaluate(
             avg_metrics
         )  # avg_metrics from trainer.train is overwritten
+        final_eval_wall_seconds = StageTimer.wall_time() - final_eval_start
 
-        total_time = time.time() - start_time
+        total_time = StageTimer.wall_time() - trial_start
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
         print(f"=== Total time: {total_time_str} ===")
-        trainer.stage_timer.print_report(trial_time=total_time, trial_id=r + 1)
+        timing = trainer.stage_timer.snapshot()
+        intermediate_eval_seconds = timing["seconds"]["intermediate_evaluation"]
+        cl_train_seconds = max(0.0, train_phase_seconds - intermediate_eval_seconds)
+        routed_training_raw_seconds = timing["seconds"]["routed_training"]
+        inference_raw_seconds = timing["seconds"]["inference_forward"]
+        inference_samples = timing["samples"]["inference_forward"]
+        routed_samples = timing["samples"]["routed_training"]
+        train_flops = trainer.flops_profiler.records.get("routed_train")
+        infer_flops = trainer.flops_profiler.records.get("inference")
+        routed_training_seconds, train_profile_overhead = remove_profiler_overhead(
+            routed_training_raw_seconds, routed_samples, train_flops
+        )
+        inference_seconds, infer_profile_overhead = remove_profiler_overhead(
+            inference_raw_seconds, inference_samples, infer_flops
+        )
+        cl_train_seconds = max(0.0, cl_train_seconds - train_profile_overhead)
+        p_routed = routed_training_seconds / cl_train_seconds if cl_train_seconds else 0.0
+        derived = {
+            "trial_wall_seconds": total_time,
+            "train_phase_including_eval_seconds": train_phase_seconds,
+            "cl_train_seconds": cl_train_seconds,
+            "final_evaluation_wall_seconds": final_eval_wall_seconds,
+            "p_routed": p_routed,
+        }
+        trainer.stage_timer.print_report(derived=derived, trial_id=r + 1)
+
+        record = {
+            "schema_version": 1,
+            "trial": r + 1,
+            "seed": seed,
+            "mode": args.smope_mode,
+            "dataset": args.dataset,
+            "trial_wall_seconds": total_time,
+            "train_phase_including_eval_seconds": train_phase_seconds,
+            "intermediate_evaluation_seconds": intermediate_eval_seconds,
+            "cl_train_seconds": cl_train_seconds,
+            "routed_training_seconds": routed_training_seconds,
+            "routed_training_raw_seconds": routed_training_raw_seconds,
+            "train_profiler_overhead_seconds": train_profile_overhead,
+            "dense_initialization_seconds": timing["seconds"]["dense_initialization"],
+            "expert_frequency_scan_seconds": timing["seconds"]["expert_frequency_scan"],
+            "prototype_statistics_seconds": timing["seconds"]["prototype_statistics"],
+            "prototype_replay_seconds": timing["seconds"]["prototype_replay"],
+            "final_evaluation_wall_seconds": final_eval_wall_seconds,
+            "inference_forward_seconds": inference_seconds,
+            "inference_forward_raw_seconds": inference_raw_seconds,
+            "inference_profiler_overhead_seconds": infer_profile_overhead,
+            "inference_samples": inference_samples,
+            "inference_seconds_per_sample": (
+                inference_seconds / inference_samples if inference_samples else None
+            ),
+            "routed_training_samples": routed_samples,
+            "p_routed": p_routed,
+        }
+        record["routed_train_flops_per_sample"] = (
+            train_flops["flops_per_sample"] if train_flops else None
+        )
+        record["inference_flops_per_sample"] = (
+            infer_flops["flops_per_sample"] if infer_flops else None
+        )
+        prompt_module = getattr(trainer.learner.model, "prompt", None)
+        if prompt_module is not None and hasattr(prompt_module, "static_route_indices"):
+            record["static_route_indices"] = (
+                prompt_module.static_route_indices.detach().cpu().tolist()
+                if prompt_module.static_routes_enabled()
+                else None
+            )
+        efficiency_records.append(record)
+        write_efficiency_records(args.log_dir, efficiency_records)
 
         # save results
         for mkey in metric_keys:

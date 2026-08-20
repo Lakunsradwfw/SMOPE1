@@ -124,6 +124,42 @@ The main entry point is the shell scripts located in `experiments/`, which utili
 
 > **Note:** Results (logs, checkpoints, and excel sheets) will be automatically saved to a folder named `outputs/`.
 
+## ⚡ Baseline vs. static-route efficiency experiments
+
+Two SMoPE execution modes are available:
+
+- `baseline`: the original dynamic routing, routing losses, and frequency scan after every task.
+- `static_route`: task 1 uses the original training and frequency scan, then compiles a fixed Top-K route for every prompted layer/head. Later tasks use packed active prompts and skip dynamic Top-K, routing losses, and frequency scans.
+
+Run matched experiments with the dataset-specific scripts:
+
+```bash
+bash experiments/cifar-100_baseline.sh
+bash experiments/cifar-100_static-route.sh
+
+bash experiments/cub-200_baseline.sh
+bash experiments/cub-200_static-route.sh
+
+bash experiments/imagenet-r_baseline.sh
+bash experiments/imagenet-r_static-route.sh
+```
+
+`GPUID`, `REPEAT`, `OVERWRITE`, and `OUTDIR` can be overridden as environment variables. Each output directory contains:
+
+- `efficiency_trials.csv` and `efficiency_trials.json`: raw per-seed measurements.
+- `efficiency_summary.json`: means, standard deviations, FLOPs profiles, and formula definitions.
+- the original accuracy, forgetting, checkpoints, and logs.
+
+Compare a matched pair, for example CIFAR-100:
+
+```bash
+python utils/compare_efficiency.py \
+  outputs/efficiency/cifar-100/10-task/baseline/efficiency_summary.json \
+  outputs/efficiency/cifar-100/10-task/static-route/efficiency_summary.json
+```
+
+The comparison prints `S_CL_train`, `S_route`, baseline `p`, Amdahl `S_overall`, `S_infer`, and routed-training/inference FLOPs reductions. `cl_train_seconds` spans all continual-training tasks and method-specific overhead but subtracts intermediate evaluation. Inference is separately measured around synchronized model forward calls. FLOPs are profiled once on representative steady-state batches using PyTorch-supported operators.
+
 ## 🤝 Acknowledgements
 
 We thank the authors of the following repositories for their code, which aided our research:

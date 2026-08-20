@@ -11,7 +11,15 @@ import copy
 
 # Our method
 class OnePrompt(nn.Module):
-    def __init__(self, emb_d, n_tasks, prompt_param, key_dim=768, num_heads=12):
+    def __init__(
+        self,
+        emb_d,
+        n_tasks,
+        prompt_param,
+        key_dim=768,
+        num_heads=12,
+        smope_mode="baseline",
+    ):
         super().__init__()
         self.task_count = 0
         self.emb_d = emb_d
@@ -29,6 +37,9 @@ class OnePrompt(nn.Module):
         head_dim = self.key_d // self.num_heads
         self.head_dim = head_dim
         self.num_experts = self.e_p_length // 2
+        self.smope_mode = smope_mode
+        if self.smope_mode not in {"baseline", "static_route"}:
+            raise ValueError("Unknown SMoPE mode: {}".format(self.smope_mode))
 
         # e prompt init
         for e in self.e_layers:
@@ -49,8 +60,82 @@ class OnePrompt(nn.Module):
         ]
         self.router_criterion = nn.CrossEntropyLoss()
 
+        # The optimized path is compiled after task 1. These fixed-size tensors
+        # make checkpoints loadable before and after route compilation.
+        num_layers = len(self.e_layers)
+        if self.smope_mode == "static_route":
+            self.static_pk = nn.Parameter(
+                torch.zeros(num_layers, self.num_heads, self.topk, self.head_dim),
+                requires_grad=False,
+            )
+            self.static_pv = nn.Parameter(
+                torch.zeros(num_layers, self.num_heads, self.topk, self.head_dim),
+                requires_grad=False,
+            )
+        else:
+            # Preserve the original baseline parameter count and checkpoints.
+            self.register_parameter("static_pk", None)
+            self.register_parameter("static_pv", None)
+        self.register_buffer(
+            "static_route_indices",
+            torch.full((num_layers, self.num_heads, self.topk), -1, dtype=torch.long),
+        )
+        self.register_buffer("static_route_ready", torch.tensor(False))
+        self._static_route_ready = False
+
+    def static_routes_enabled(self):
+        return self.smope_mode == "static_route" and self._static_route_ready
+
+    def sync_static_route_state(self):
+        """Synchronize Python/runtime state after loading a checkpoint."""
+        self._static_route_ready = bool(self.static_route_ready.detach().cpu().item())
+        if self.static_routes_enabled():
+            self.static_pk.requires_grad_(True)
+            self.static_pv.requires_grad_(True)
+            for e in self.e_layers:
+                for l in range(self.num_experts):
+                    for h in range(self.num_heads):
+                        getattr(self, f"e_pk_{e}_{l}_{h}").requires_grad_(False)
+                        getattr(self, f"e_pv_{e}_{l}_{h}").requires_grad_(False)
+
+    def freeze_routes(self):
+        """Compile task-1 frequency statistics into fixed per-head Top-K prompts."""
+        if self.smope_mode != "static_route" or self._static_route_ready:
+            return False
+
+        route_indices = torch.empty_like(self.static_route_indices)
+        with torch.no_grad():
+            for layer_pos, e in enumerate(self.e_layers):
+                for h in range(self.num_heads):
+                    frequency = torch.tensor(
+                        [
+                            getattr(self, f"e_freq_{e}_{l}_{h}")
+                            for l in range(self.num_experts)
+                        ],
+                        dtype=torch.float32,
+                    )
+                    indices = torch.topk(frequency, self.topk, sorted=True).indices
+                    route_indices[layer_pos, h].copy_(indices)
+                    for static_pos, expert_id in enumerate(indices.tolist()):
+                        self.static_pk[layer_pos, h, static_pos].copy_(
+                            getattr(self, f"e_pk_{e}_{expert_id}_{h}").squeeze(0)
+                        )
+                        self.static_pv[layer_pos, h, static_pos].copy_(
+                            getattr(self, f"e_pv_{e}_{expert_id}_{h}").squeeze(0)
+                        )
+
+            self.static_route_indices.copy_(route_indices)
+            self.static_route_ready.fill_(True)
+        self._static_route_ready = True
+        self.sync_static_route_state()
+        print("Static SMoPE routes compiled from task-1 expert frequencies")
+        print("Static route indices:", self.static_route_indices.detach().cpu().tolist())
+        return True
+
     def process_task_count(self):
         self.task_count += 1
+        if self.static_routes_enabled():
+            return
         self.save_old_prompts()
 
         for e in self.e_layers:
@@ -71,6 +156,11 @@ class OnePrompt(nn.Module):
 
     def router_loss(self, prompt_scores, task_id=-1, topk=-1):
         loss = 0.0
+
+        # Selection is constant after compilation, so both routing objectives
+        # become pure overhead and cannot change the selected expert set.
+        if self.static_routes_enabled():
+            return loss
 
         if self.mu_router > 0 and topk > 0:
             max_loss = 0
@@ -151,6 +241,17 @@ class OnePrompt(nn.Module):
         if l in self.e_layers:
             e_valid = True
             B = x_block.shape[0]
+            if self.static_routes_enabled():
+                layer_pos = self.e_layers.index(l)
+                pk = self.static_pk[layer_pos]
+                pv = self.static_pv[layer_pos]
+                eps_decay = torch.zeros(
+                    self.num_heads, self.topk, device=pk.device, dtype=pk.dtype
+                )
+                Ek = pk.unsqueeze(0).expand(B, -1, -1, -1)
+                Ev = pv.unsqueeze(0).expand(B, -1, -1, -1)
+                return [Ek, Ev, eps_decay], loss, x_block
+
             pk = []  # (num_heads, num_prompt, head_dim)
             pv = []
             eps_decay = []
@@ -213,7 +314,7 @@ class OnePrompt(nn.Module):
         self.num_samples += num_samples
 
     def update_prompt(self, prompt_scores):
-        if self.topk > 0:
+        if self.topk > 0 and not self.static_routes_enabled():
             for e in self.e_layers:
                 prompt_score, _ = prompt_scores[e]  # (B, num_heads, 1, num_prompt)
                 for h in range(self.num_heads):
@@ -696,6 +797,7 @@ class ViTZoo(nn.Module):
         prompt_flag=False,
         prompt_param=None,
         pretrained=None,
+        smope_mode="baseline",
     ):
         super(ViTZoo, self).__init__()
 
@@ -771,7 +873,11 @@ class ViTZoo(nn.Module):
             self.prompt = VQPrompt(768, prompt_param[0], prompt_param[1])
         elif self.prompt_flag == "smope":
             self.prompt = OnePrompt(
-                768, prompt_param[0], prompt_param[1], num_heads=12
+                768,
+                prompt_param[0],
+                prompt_param[1],
+                num_heads=12,
+                smope_mode=smope_mode,
             )
         else:
             self.prompt = None
@@ -797,6 +903,9 @@ class ViTZoo(nn.Module):
             if self.prompt_flag == "smope":
                 reduce_query = True
                 if dense:
+                    topk = -1
+                elif self.prompt.static_routes_enabled():
+                    # The prompt tensors already contain exactly the compiled K.
                     topk = -1
                 else:
                     topk = self.prompt.topk
@@ -1018,7 +1127,12 @@ class ViTZoo(nn.Module):
 
 
 def vit_pt_imnet(
-    out_dim, block_division=None, prompt_flag="None", prompt_param=None, pretrained=None
+    out_dim,
+    block_division=None,
+    prompt_flag="None",
+    prompt_param=None,
+    pretrained=None,
+    smope_mode="baseline",
 ):
     return ViTZoo(
         num_classes=out_dim,
@@ -1026,6 +1140,7 @@ def vit_pt_imnet(
         prompt_flag=prompt_flag,
         prompt_param=prompt_param,
         pretrained=pretrained,
+        smope_mode=smope_mode,
     )
 
 

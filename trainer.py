@@ -456,6 +456,40 @@ class Trainer:
 
         return avg_metrics
 
+    def profile_flops(self):
+        """Profile representative train/inference batches after formal timing."""
+        if not self.flops_profiler.enabled or self.max_task <= 0:
+            return
+
+        print("=== Profiling FLOPs outside formal timing ===")
+        try:
+            self.train_dataset.load_dataset(self.max_task - 1, train=True)
+            profile_loader = DataLoader(
+                self.train_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                drop_last=False,
+                num_workers=self.workers,
+                pin_memory=True,
+            )
+            inputs, targets, _ = next(iter(profile_loader))
+            if self.learner.gpu:
+                inputs = inputs.cuda()
+                targets = targets.cuda()
+
+            self.learner.data_weighting(self.train_dataset)
+            self.learner.init_optimizer()
+            self.learner.model.train()
+            with self.flops_profiler.profile_once("routed_train", inputs.size(0)):
+                self.learner.update_model(inputs, targets)
+
+            self.learner.model.eval()
+            with self.flops_profiler.profile_once("inference", inputs.size(0)):
+                with torch.no_grad():
+                    self.learner.model(inputs)
+        except Exception as error:
+            print("WARNING: FLOPs profiling failed outside formal timing: {}".format(error))
+
     @torch.no_grad()
     def _compute_mean(self, model: torch.nn.Module, class_mask=None):
         with self.stage_timer.measure("prototype_statistics"):

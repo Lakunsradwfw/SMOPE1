@@ -285,12 +285,7 @@ class OnePrompt(Prompt):
                         y = y.cuda()
 
                     # model update
-                    profile_name = "routed_train" if not dense and self.task_count > 0 else None
-                    if profile_name is None:
-                        loss, output = self.update_model(x, y, dense=dense)
-                    else:
-                        with self.flops_profiler.profile_once(profile_name, x.size(0)):
-                            loss, output = self.update_model(x, y, dense=dense)
+                    loss, output = self.update_model(x, y, dense=dense)
                     self.stage_timer.add_samples(
                         "dense_initialization" if dense else "routed_training", x.size(0)
                     )
@@ -344,12 +339,7 @@ class OnePrompt(Prompt):
                         y = y.cuda()
 
                     # model update
-                    profile_name = "routed_train" if not dense and self.task_count > 0 else None
-                    if profile_name is None:
-                        loss, output = self.update_model(x, y, dense=dense)
-                    else:
-                        with self.flops_profiler.profile_once(profile_name, x.size(0)):
-                            loss, output = self.update_model(x, y, dense=dense)
+                    loss, output = self.update_model(x, y, dense=dense)
                     self.stage_timer.add_samples(
                         "dense_initialization" if dense else "routed_training", x.size(0)
                     )

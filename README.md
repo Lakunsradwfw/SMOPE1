@@ -158,7 +158,7 @@ python utils/compare_efficiency.py \
   outputs/efficiency/cifar-100/10-task/static-route/efficiency_summary.json
 ```
 
-The comparison prints `S_CL_train`, `S_route`, baseline `p`, Amdahl `S_overall`, `S_infer`, and routed-training/inference FLOPs reductions. `cl_train_seconds` spans all continual-training tasks and method-specific overhead but subtracts intermediate evaluation. Inference is separately measured around synchronized model forward calls. FLOPs are profiled once on representative steady-state batches using PyTorch-supported operators.
+The comparison prints `S_CL_train`, `S_route`, baseline `p`, Amdahl `S_overall`, `S_infer`, and routed-training/inference FLOPs reductions. `cl_train_seconds` spans all continual-training tasks and method-specific overhead but subtracts intermediate evaluation. Inference forwards are measured with asynchronous CUDA events and resolved with one final synchronization. FLOPs are profiled on representative batches only after all formal timings have finished, using PyTorch-supported operators.
 
 ## 🤝 Acknowledgements
 

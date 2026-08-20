@@ -31,6 +31,7 @@ class StageTimer:
         self.elapsed = OrderedDict((name, 0.0) for name in self.STAGES)
         self.calls = OrderedDict((name, 0) for name in self.STAGES)
         self.samples = OrderedDict((name, 0) for name in self.STAGES)
+        self._pending_cuda_events = []
 
     @staticmethod
     def synchronize_cuda():
@@ -57,12 +58,53 @@ class StageTimer:
             self.calls[stage] += 1
             self.samples[stage] += int(samples)
 
+    @contextmanager
+    def measure_device(self, stage, samples=0):
+        """Measure device work without synchronizing the CUDA stream per call.
+
+        CUDA event pairs are collected here and resolved together by ``snapshot``.
+        This keeps high-frequency measurements, such as validation forwards, from
+        changing the execution pipeline that is being benchmarked.
+        """
+        if stage not in self.elapsed:
+            raise KeyError("Unknown timing stage: {}".format(stage))
+
+        if torch.cuda.is_available() and torch.cuda.is_initialized():
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            try:
+                yield
+            finally:
+                end.record()
+                self._pending_cuda_events.append((stage, start, end))
+                self.calls[stage] += 1
+                self.samples[stage] += int(samples)
+            return
+
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.elapsed[stage] += time.perf_counter() - start
+            self.calls[stage] += 1
+            self.samples[stage] += int(samples)
+
+    def flush_device_events(self):
+        if not self._pending_cuda_events:
+            return
+        torch.cuda.synchronize()
+        for stage, start, end in self._pending_cuda_events:
+            self.elapsed[stage] += start.elapsed_time(end) / 1000.0
+        self._pending_cuda_events.clear()
+
     def add_samples(self, stage, count):
         if stage not in self.samples:
             raise KeyError("Unknown timing stage: {}".format(stage))
         self.samples[stage] += int(count)
 
     def snapshot(self):
+        self.flush_device_events()
         return {
             "seconds": dict(self.elapsed),
             "calls": dict(self.calls),
@@ -70,6 +112,7 @@ class StageTimer:
         }
 
     def print_report(self, derived=None, trial_id=None):
+        self.flush_device_events()
         title = "=== Efficiency timing"
         if trial_id is not None:
             title += " for trial {}".format(trial_id)

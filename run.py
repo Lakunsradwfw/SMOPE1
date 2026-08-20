@@ -17,21 +17,6 @@ from utils.efficiency import write_efficiency_records
 from utils.stage_timer import StageTimer
 
 
-def remove_profiler_overhead(total_seconds, total_samples, profile_record):
-    """Estimate timing without one-off profiler instrumentation overhead."""
-    if not profile_record or not total_samples:
-        return total_seconds, 0.0
-    profile_samples = profile_record.get("samples", 0)
-    profile_wall = profile_record.get("profiled_wall_seconds", 0.0)
-    unprofiled_samples = total_samples - profile_samples
-    unprofiled_seconds = max(0.0, total_seconds - profile_wall)
-    if unprofiled_samples <= 0:
-        return total_seconds, 0.0
-    expected_batch_seconds = unprofiled_seconds * profile_samples / unprofiled_samples
-    overhead = max(0.0, profile_wall - expected_batch_seconds)
-    return max(0.0, total_seconds - overhead), overhead
-
-
 def create_args():
 
     # This function prepares the variables shared across demo.py
@@ -320,21 +305,17 @@ if __name__ == "__main__":
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
         print(f"=== Total time: {total_time_str} ===")
         timing = trainer.stage_timer.snapshot()
+        # FLOPs profiling is deliberately performed only after every formal wall
+        # time and stage timer has been finalized.
+        trainer.profile_flops()
         intermediate_eval_seconds = timing["seconds"]["intermediate_evaluation"]
         cl_train_seconds = max(0.0, train_phase_seconds - intermediate_eval_seconds)
-        routed_training_raw_seconds = timing["seconds"]["routed_training"]
-        inference_raw_seconds = timing["seconds"]["inference_forward"]
+        routed_training_seconds = timing["seconds"]["routed_training"]
+        inference_seconds = timing["seconds"]["inference_forward"]
         inference_samples = timing["samples"]["inference_forward"]
         routed_samples = timing["samples"]["routed_training"]
         train_flops = trainer.flops_profiler.records.get("routed_train")
         infer_flops = trainer.flops_profiler.records.get("inference")
-        routed_training_seconds, train_profile_overhead = remove_profiler_overhead(
-            routed_training_raw_seconds, routed_samples, train_flops
-        )
-        inference_seconds, infer_profile_overhead = remove_profiler_overhead(
-            inference_raw_seconds, inference_samples, infer_flops
-        )
-        cl_train_seconds = max(0.0, cl_train_seconds - train_profile_overhead)
         p_routed = routed_training_seconds / cl_train_seconds if cl_train_seconds else 0.0
         derived = {
             "trial_wall_seconds": total_time,
@@ -346,7 +327,9 @@ if __name__ == "__main__":
         trainer.stage_timer.print_report(derived=derived, trial_id=r + 1)
 
         record = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "timing_instrumentation": "async_cuda_events",
+            "flops_profile_outside_formal_timing": True,
             "trial": r + 1,
             "seed": seed,
             "mode": args.smope_mode,
@@ -356,16 +339,12 @@ if __name__ == "__main__":
             "intermediate_evaluation_seconds": intermediate_eval_seconds,
             "cl_train_seconds": cl_train_seconds,
             "routed_training_seconds": routed_training_seconds,
-            "routed_training_raw_seconds": routed_training_raw_seconds,
-            "train_profiler_overhead_seconds": train_profile_overhead,
             "dense_initialization_seconds": timing["seconds"]["dense_initialization"],
             "expert_frequency_scan_seconds": timing["seconds"]["expert_frequency_scan"],
             "prototype_statistics_seconds": timing["seconds"]["prototype_statistics"],
             "prototype_replay_seconds": timing["seconds"]["prototype_replay"],
             "final_evaluation_wall_seconds": final_eval_wall_seconds,
             "inference_forward_seconds": inference_seconds,
-            "inference_forward_raw_seconds": inference_raw_seconds,
-            "inference_profiler_overhead_seconds": infer_profile_overhead,
             "inference_samples": inference_samples,
             "inference_seconds_per_sample": (
                 inference_seconds / inference_samples if inference_samples else None

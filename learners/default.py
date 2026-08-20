@@ -266,10 +266,11 @@ class NormalNN(nn.Module):
                     target = target.cuda()
             if task_in is None:
                 # Add torch.no_grad to save memory
-                with self.stage_timer.measure("inference_forward", samples=input.size(0)):
-                    with self.flops_profiler.profile_once("inference", input.size(0)):
-                        with torch.no_grad():
-                            output = model.forward(input)[:, : self.valid_out_dim]
+                with self.stage_timer.measure_device(
+                    "inference_forward", samples=input.size(0)
+                ):
+                    with torch.no_grad():
+                        output = model.forward(input)[:, : self.valid_out_dim]
                 # output = model.forward(input)[:, :self.valid_out_dim]
                 # TODO: try other task_metric?
                 acc = accumulate_acc(output, target, task, acc, topk=(self.top_k,))
@@ -293,10 +294,11 @@ class NormalNN(nn.Module):
                 if len(target) > 1:
                     if task_global:
                         # Add torch.no_grad to save memory
-                        with self.stage_timer.measure("inference_forward", samples=input.size(0)):
-                            with self.flops_profiler.profile_once("inference", input.size(0)):
-                                with torch.no_grad():
-                                    output = model.forward(input)[:, : self.valid_out_dim]
+                        with self.stage_timer.measure_device(
+                            "inference_forward", samples=input.size(0)
+                        ):
+                            with torch.no_grad():
+                                output = model.forward(input)[:, : self.valid_out_dim]
                         # output = model.forward(input)[:, :self.valid_out_dim]
                         # TODO: try other task_metric?
                         acc = accumulate_acc(
@@ -304,10 +306,11 @@ class NormalNN(nn.Module):
                         )
                     else:
                         # Add torch.no_grad to save memory
-                        with self.stage_timer.measure("inference_forward", samples=input.size(0)):
-                            with self.flops_profiler.profile_once("inference", input.size(0)):
-                                with torch.no_grad():
-                                    output = model.forward(input)[:, task_in]
+                        with self.stage_timer.measure_device(
+                            "inference_forward", samples=input.size(0)
+                        ):
+                            with torch.no_grad():
+                                output = model.forward(input)[:, task_in]
                         # output = model.forward(input)[:, task_in]
                         # TODO: try other task_metric?
                         acc = accumulate_acc(

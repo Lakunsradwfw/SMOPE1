@@ -1,4 +1,6 @@
 # repo-specific stuff
+.venv-qwen/
+*.safetensors
 .cursor/
 .trellis/
 AGENTS.md

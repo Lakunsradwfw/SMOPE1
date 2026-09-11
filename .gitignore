@@ -1,5 +1,6 @@
 # repo-specific stuff
 .venv-qwen/
+.venv2/
 *.safetensors
 .cursor/
 .trellis/
@@ -8,8 +9,10 @@ continual_papers_feasibility_part3.md
 data/
 data
 outputs
+output
 pretrained
 outputs/
+output/
 pretrained/
 *.pt
 \#*#

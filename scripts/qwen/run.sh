@@ -17,6 +17,6 @@ for SEED in ${SEEDS:-0}; do
   OUT="${OUTPUT_ROOT:-outputs/qwen}/${DATASET}/${METHOD}/${MODE}/seed-${SEED}"
   torchrun --standalone --nproc_per_node="${NPROC_PER_NODE:-2}" -m qwen_smope.train \
     --dataset "$DATASET" --method "$METHOD" --mode "$MODE" --seed "$SEED" \
-    --model-path "${MODEL_PATH:-pretrained/Qwen3.5-9B}" --data-root "${DATA_ROOT:-data}" \
+    --model-path "${MODEL_PATH:-pretrained/Qwen3.5-9B-Base}" --data-root "${DATA_ROOT:-data}" \
     --output "$OUT" "$@"
 done

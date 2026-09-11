@@ -29,7 +29,7 @@ def arguments():
     p.add_argument("--dataset", choices=DATASETS, required=True)
     p.add_argument("--method", choices=["head_only", "smope"], default="smope")
     p.add_argument("--mode", choices=["smoke", "full", "preflight"], default="smoke")
-    p.add_argument("--model-path", default="pretrained/Qwen3.5-9B")
+    p.add_argument("--model-path", default="pretrained/Qwen3.5-9B-Base")
     p.add_argument("--data-root", default="data")
     p.add_argument("--output", required=True)
     p.add_argument("--resume", action="store_true")
@@ -301,6 +301,11 @@ def main():
     train, test, tasks = build_datasets(args.dataset, args.data_root, args.seed)
     from transformers import AutoProcessor
     processor = AutoProcessor.from_pretrained(args.model_path, local_files_only=True)
+    
+    if getattr(processor, "chat_template", None) is None:
+        tokenizer = getattr(processor, "tokenizer", None)
+        if tokenizer is not None and getattr(tokenizer, "chat_template", None):
+            processor.chat_template = tokenizer.chat_template
     processor.tokenizer.padding_side = "right"
     collate = Collator(processor, args.max_visual_tokens)
     classes, width = DATASETS[args.dataset][0], len(tasks[0])
@@ -436,7 +441,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except torch.OutOfMemoryError:
+    except torch.cuda.OutOfMemoryError:
         print("CUDA OOM: reduce --max-visual-tokens or --batch-size, then start a NEW run. "
               "DDP replicates weights on each GPU; two 40GB cards are not one 80GB card.", flush=True)
         raise

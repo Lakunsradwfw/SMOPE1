@@ -124,6 +124,42 @@ The main entry point is the shell scripts located in `experiments/`, which utili
 
 > **Note:** Results (logs, checkpoints, and excel sheets) will be automatically saved to a folder named `outputs/`.
 
+## ⚡ Baseline vs. static-route efficiency experiments
+
+Two SMoPE execution modes are available:
+
+- `baseline`: the original dynamic routing, routing losses, and frequency scan after every task.
+- `static_route`: task 1 uses the original training and frequency scan, then compiles a fixed Top-K route for every prompted layer/head. Later tasks use packed active prompts and skip dynamic Top-K, routing losses, and frequency scans.
+
+Run matched experiments with the dataset-specific scripts:
+
+```bash
+bash experiments/cifar-100_baseline.sh
+bash experiments/cifar-100_static-route.sh
+
+bash experiments/cub-200_baseline.sh
+bash experiments/cub-200_static-route.sh
+
+bash experiments/imagenet-r_baseline.sh
+bash experiments/imagenet-r_static-route.sh
+```
+
+`GPUID`, `REPEAT`, `OVERWRITE`, and `OUTDIR` can be overridden as environment variables. Each output directory contains:
+
+- `efficiency_trials.csv` and `efficiency_trials.json`: raw per-seed measurements.
+- `efficiency_summary.json`: means, standard deviations, FLOPs profiles, and formula definitions.
+- the original accuracy, forgetting, checkpoints, and logs.
+
+Compare a matched pair, for example CIFAR-100:
+
+```bash
+python utils/compare_efficiency.py \
+  outputs/efficiency/cifar-100/10-task/baseline/efficiency_summary.json \
+  outputs/efficiency/cifar-100/10-task/static-route/efficiency_summary.json
+```
+
+The comparison prints `S_CL_train`, `S_route`, baseline `p`, Amdahl `S_overall`, `S_infer`, and routed-training/inference FLOPs reductions. `cl_train_seconds` spans all continual-training tasks and method-specific overhead but subtracts intermediate evaluation. Inference forwards are measured with asynchronous CUDA events and resolved with one final synchronization. FLOPs are profiled on representative batches only after all formal timings have finished, using PyTorch-supported operators.
+
 ## 🤝 Acknowledgements
 
 We thank the authors of the following repositories for their code, which aided our research:
@@ -144,7 +180,10 @@ If you find our work or this codebase helpful, please consider citing:
 }
 ```
 
-source .venv/bin/activate
+
+deactivate \
+conda deactivate \
+source .venv2/bin/activate
 
 cd /ai/teacher/zq/SMoPE/data
 # ImageNet-R：HF-Mirror 上的整包（与官方同体积）
@@ -162,3 +201,7 @@ curl -L -C - -o vit_base_patch16_224_augreg_in21k.bin "https://hf-mirror.com/tim
 curl -L -C - -o vit_base_patch16_224_augreg2_in21k_ft_in1k.bin "https://hf-mirror.com/timm/vit_base_patch16_224.augreg2_in21k_ft_in1k/resolve/main/pytorch_model.bin"
 curl -L -C - -o ibot_vit_base16.pth "https://lf3-nlp-opensource.bytetos.com/obj/nlp-opensource/archive/2022/ibot/vitb_16/checkpoint_teacher.pth"
 curl -L -C - -o dino_vitbase16_pretrain.pth "https://dl.fbaipublicfiles.com/dino/dino_vitbase16_pretrain/dino_vitbase16_pretrain.pth"
+
+MODEL_PATH=pretrained/Qwen3.5-9B-Base \
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 \
+bash scripts/qwen/cifar100.sh smoke smope

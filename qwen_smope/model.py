@@ -4,6 +4,7 @@ Classification only: sample-level mean-query routing sees the entire input.
 It is deliberately NOT a causal generation/cache implementation.
 """
 from types import MethodType
+import time
 
 import torch
 from torch import nn
@@ -61,13 +62,15 @@ class Experts(nn.Module):
             adjusted = scores + (1 - selected) * self.epsilon * span
             logp = F.log_softmax(adjusted, -1)
             router = -logp.gather(-1, targets).sum((1, 2)).mean()
-        if bool(self.has_old):
-            for h in range(self.pk.shape[0]):
-                anchors = self.old_pk[h, self.used[h]].detach()
-                if anchors.numel():
-                    targets = (anchors @ self.old_pk[h].T).topk(self.topk, -1).indices
-                    logp = F.log_softmax(anchors @ self.pk[h].T, -1)
-                    old = old - logp.gather(-1, targets).sum(-1).mean()
+        # Fixed-size batched computation avoids per-head boolean indexing (and
+        # CUDA host synchronization). Average over used anchors within each head,
+        # then sum heads, exactly as in the original loss.
+        anchors = self.old_pk.detach()
+        targets = (anchors @ anchors.transpose(-1, -2)).topk(self.topk, -1).indices
+        logp = F.log_softmax(anchors @ self.pk.transpose(-1, -2), -1)
+        per_anchor = -logp.gather(-1, targets).sum(-1)
+        active = self.used.to(per_anchor.dtype) * self.has_old.to(per_anchor.dtype)
+        old = old + ((per_anchor * active).sum(-1) / active.sum(-1).clamp_min(1)).sum()
         return router, old
 
 
@@ -139,9 +142,10 @@ class QwenClassifier(nn.Module):
         features = outputs.last_hidden_state[torch.arange(valid.shape[0], device=valid.device), last]
         logits = self.classifier(features.float())
         router, old = logits.sum() * 0, logits.sum() * 0
-        for expert in self.expert_modules():
-            r, o = expert.losses(dense)
-            router, old = router + r, old + o
+        if self.training:
+            for expert in self.expert_modules():
+                r, o = expert.losses(dense)
+                router, old = router + r, old + o
         return logits, router * self.router_weight, old * self.old_weight, features.float()
 
     def lightweight_state(self):
@@ -160,11 +164,26 @@ def load_model(path, classes, device, **kwargs):
     from transformers import Qwen3_5Model
     if transformers.__version__ != "5.3.0":
         raise RuntimeError("This adapter is tested against transformers==5.3.0; install requirements-qwen.txt")
+    started = time.perf_counter()
     backbone, info = Qwen3_5Model.from_pretrained(
         path, local_files_only=True, dtype=torch.bfloat16, attn_implementation="eager", output_loading_info=True)
+    loaded = time.perf_counter()
     if info.get("missing_keys") or info.get("mismatched_keys") or info.get("error_msgs"):
         raise RuntimeError(f"Incomplete/incompatible base weights: {info}")
-    model = QwenClassifier(backbone, classes, **kwargs).to(device)
+    model = QwenClassifier(backbone, classes, **kwargs)
+    adapted = time.perf_counter()
+    model.to(device)
+    if torch.device(device).type == "cuda":
+        torch.cuda.synchronize(device)
+    moved = time.perf_counter()
     if model.method == "smope":
         backbone.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as implementation
+    model.loading_profile = dict(
+        pretrained_cpu_seconds=loaded - started,
+        adapter_init_seconds=adapted - loaded,
+        move_to_device_seconds=moved - adapted,
+        linear_attention_kernels={name: getattr(implementation, name, None) is not None for name in (
+            "causal_conv1d_fn", "causal_conv1d_update", "chunk_gated_delta_rule",
+            "fused_recurrent_gated_delta_rule")})
     return model

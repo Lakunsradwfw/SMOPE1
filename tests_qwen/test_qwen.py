@@ -39,6 +39,28 @@ def tiny_inputs():
 
 
 class ExpertTests(unittest.TestCase):
+    def test_batched_old_loss_matches_loop_value_and_gradient(self):
+        torch.manual_seed(12)
+        for has_old in (False, True):
+            e = Experts(3, 5, 8, 2)
+            e.old_pk.normal_()
+            e.has_old.fill_(has_old)
+            # Unequal counts and an empty head catch incorrect normalization.
+            e.used[0, :2] = True
+            e.used[1, :] = True
+            actual = e.losses()[1]
+            expected = e.pk.sum() * 0
+            if has_old:
+                for h in range(3):
+                    anchors = e.old_pk[h, e.used[h]]
+                    if anchors.numel():
+                        targets = (anchors @ e.old_pk[h].T).topk(2, -1).indices
+                        logp = F.log_softmax(anchors @ e.pk[h].T, -1)
+                        expected = expected - logp.gather(-1, targets).sum(-1).mean()
+            torch.testing.assert_close(actual, expected)
+            torch.testing.assert_close(torch.autograd.grad(actual, e.pk)[0],
+                                       torch.autograd.grad(expected, e.pk)[0])
+
     def test_topk_padding_and_old_state(self):
         e = Experts(2, 5, 8, 2)
         q = torch.randn(1, 2, 3, 8)
@@ -86,6 +108,19 @@ class ModelTests(unittest.TestCase):
             actual = model(inputs)[0]
             expected = model.classifier(model.backbone(**inputs, use_cache=False).last_hidden_state[:, -1].float())
         torch.testing.assert_close(actual, expected)
+
+    def test_eval_skips_losses_without_changing_predictions(self):
+        from unittest.mock import patch
+        model = tiny_model()
+        inputs = tiny_inputs()
+        with torch.no_grad():
+            expected = model(inputs)[0]
+            model.eval()
+            with patch.object(Experts, "losses", side_effect=AssertionError("unused eval loss")):
+                actual, router, old, _ = model(inputs)
+        torch.testing.assert_close(actual, expected)
+        self.assertEqual(float(router), 0.)
+        self.assertEqual(float(old), 0.)
 
     def test_multimodal_backward_checkpoint_and_restore(self):
         model = tiny_model()

@@ -338,6 +338,8 @@ def main():
     with stage(args, "model_loading", -1, device, rank, world):
         model = load_model(args.model_path, classes, device, method=args.method, experts=args.experts,
                            topk=args.topk, epsilon=args.epsilon, router_weight=args.router_weight, old_weight=args.old_weight)
+    if rank == 0:
+        event(args.output, dict(type="loading_profile", **model.loading_profile))
     if checkpoint:
         model.load_lightweight_state(checkpoint["adapter"])
     network = DDP(model, device_ids=[local_rank], broadcast_buffers=False) if world > 1 else model

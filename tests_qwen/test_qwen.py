@@ -39,6 +39,22 @@ def tiny_inputs():
 
 
 class ExpertTests(unittest.TestCase):
+    def test_eval_does_not_penalize_zero_frequency_experts(self):
+        e = Experts(1, 3, 2, topk=1, epsilon=.4)
+        with torch.no_grad():
+            e.pk.copy_(torch.tensor([[[3., 0.], [2.5, 0.], [1., 0.]]]))
+            e.frequency[0, 1:] = 1
+            e.used[0, 0] = True
+        q = torch.tensor([[[[1., 0.]]]])
+        valid = torch.ones(1, 1, dtype=torch.bool)
+
+        e.select(q, valid, training=False)
+        torch.testing.assert_close(e.last_labels, e.last_scores)
+        self.assertEqual(int(e.last_indices.item()), 0)
+
+        e.select(q, valid, training=True)
+        self.assertEqual(int(e.last_indices.item()), 1)
+
     def test_batched_old_loss_matches_loop_value_and_gradient(self):
         torch.manual_seed(12)
         for has_old in (False, True):

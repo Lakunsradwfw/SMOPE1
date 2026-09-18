@@ -5,6 +5,7 @@ from datetime import timedelta
 import hashlib
 import json
 import math
+import multiprocessing as mp
 import os
 from pathlib import Path
 import platform
@@ -24,6 +25,11 @@ from .model import load_model
 from .report import event, summarize, write_json
 
 
+WORKER_START_METHODS = tuple(
+    method for method in ("forkserver", "spawn") if method in mp.get_all_start_methods())
+DEFAULT_WORKER_START_METHOD = "forkserver" if "forkserver" in WORKER_START_METHODS else "spawn"
+
+
 def arguments():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dataset", choices=DATASETS, required=True)
@@ -39,6 +45,9 @@ def arguments():
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--accumulation", type=int, default=8)
     p.add_argument("--workers", type=int, default=2)
+    p.add_argument("--worker-start-method", choices=WORKER_START_METHODS,
+                   default=DEFAULT_WORKER_START_METHOD,
+                   help="Safe multiprocessing context for DataLoader workers")
     p.add_argument("--max-visual-tokens", type=int, default=256)
     p.add_argument("--experts", type=int, default=25)
     p.add_argument("--topk", type=int, default=5)
@@ -112,10 +121,13 @@ def save_checkpoint(path, model, progress, optimizer, scheduler, matrix, prototy
 
 def make_loader(view, collate, args, rank, world, train=False):
     sampler = DistributedSampler(view, num_replicas=world, rank=rank, seed=args.seed, shuffle=True) if train else ExactShard(view, rank, world)
-    # Dataset order and processor are deterministic. Keep workers off CUDA.
+    # CUDA is initialized before loaders are iterated. Avoid Linux's unsafe default
+    # fork context; workers still remain CPU-only.
     generator = torch.Generator().manual_seed(args.seed)
+    worker_context = args.worker_start_method if args.workers > 0 else None
     return DataLoader(view, batch_size=args.batch_size, sampler=sampler, collate_fn=collate,
-                      num_workers=args.workers, pin_memory=True, generator=generator), sampler
+                      num_workers=args.workers, pin_memory=True, generator=generator,
+                      multiprocessing_context=worker_context), sampler
 
 
 def optimizer_for(model, args):
@@ -311,7 +323,8 @@ def main():
     classes, width = DATASETS[args.dataset][0], len(tasks[0])
     # Fail on corrupt images/processor before allocating base-model GPU memory.
     collate([train[0][:2]])
-    identity = {k: v for k, v in vars(args).items() if k not in ("output", "resume", "workers", "log_every", "model_path", "data_root")}
+    identity = {k: v for k, v in vars(args).items() if k not in (
+        "output", "resume", "workers", "worker_start_method", "log_every", "model_path", "data_root")}
     index_path = Path(args.model_path) / "model.safetensors.index.json"
     signature = dict(arguments=identity, world_size=world, tasks=tasks, config=config,
                      weight_index_sha256=hashlib.sha256(index_path.read_bytes()).hexdigest() if index_path.exists() else None)

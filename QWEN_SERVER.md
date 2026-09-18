@@ -90,6 +90,12 @@ OUTPUT_ROOT=outputs/qwen-top3 bash scripts/qwen/cifar100.sh full smope --topk 3
 # 恢复原实验：同一输出路径、世界大小、种子和训练参数
 bash scripts/qwen/cifar100.sh full smope --resume
 
+# Linux 上 DataLoader 多进程使用 forkserver，避免 CUDA 初始化后的 fork
+bash scripts/qwen/cifar100.sh full smope --workers 1 --worker-start-method forkserver
+
+# 若 forkserver 与环境中的第三方库不兼容，可改用隔离更彻底但启动更慢的 spawn
+bash scripts/qwen/cifar100.sh full smope --workers 1 --worker-start-method spawn
+
 # 单卡调试。DDP 每卡一份主干，两张 40GB 不等于一张 80GB
 NPROC_PER_NODE=1 CUDA_VISIBLE_DEVICES=0 OUTPUT_ROOT=outputs/qwen-single \
   bash scripts/qwen/cifar100.sh smoke smope

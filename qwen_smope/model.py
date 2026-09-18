@@ -39,8 +39,11 @@ class Experts(nn.Module):
         mean_q = (q * weights).sum(2, keepdim=True) / weights.sum(2, keepdim=True).clamp_min(1)
         scores = mean_q.float() @ self.pk.float().transpose(-1, -2)
         span = (scores.detach().amax(-1, keepdim=True) - scores.detach().amin(-1, keepdim=True))
-        penalty = self.used.float() * self.epsilon if training else (self.frequency == 0).float() * 2.0
-        labels = scores - span * penalty[None, :, None, :]
+        # During evaluation/frequency scans, route only by the learned scores.
+        # Penalising zero-frequency experts here permanently locked routing to
+        # the first task's Top-K and prevented newly trained experts from being observed.
+        labels = (scores - span * self.used.float()[None, :, None, :] * self.epsilon
+                  if training else scores)
         indices = labels.topk(self.topk, dim=-1).indices.squeeze(2)
         self.last_scores, self.last_labels, self.last_indices = scores, labels.detach(), indices.detach()
         b = q.shape[0]

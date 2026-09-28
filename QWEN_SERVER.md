@@ -1,175 +1,115 @@
-# Qwen3.5-9B + SMoPE：双 A100 40GB 运行说明
+# Qwen3.5-9B + CoIN 实验说明
 
-本入口把原 SMoPE 的按头 K/V Prompt 专家迁移到 Qwen3.5 的完整注意力层。
-保留原 ViT 代码；Qwen 训练使用独立入口 `qwen_smope.train`。
-这是整段图文输入分类，**不是自回归生成，也不是把 Qwen FFN 改成参数 MoE**。
+本入口在 CoIN 八任务上运行三种可比较配置，全部从 post-trained 多模态
+`Qwen/Qwen3.5-9B` 开始，不再支持旧的 Base+CIFAR/CUB/ImageNet-R 分类实验。
 
-## 1. 环境与文件
+| method | 训练 | 保存内容 |
+|---|---|---|
+| `zero_shot` | 不训练，直接生成 | 指标、逐样本预测、环境信息 |
+| `lora` | 顺序 LoRA | 最新轻量 adapter、指标、预测 |
+| `smope` | 顺序生成式 SMoPE | 最新轻量 adapter、指标、预测、路由统计 |
 
-推荐 Linux、Python 3.11、两张 A100 40GB。PyTorch CUDA 12.4 wheel 需要兼容的 NVIDIA 驱动；安装前运行 `nvidia-smi`。
-请使用独立环境，不在原 ViT 环境安装这些依赖。
+基础模型不会复制到输出目录，也不保存逐任务完整 checkpoint。连续训练只覆盖写入一个
+`latest_adapter.pt`，其中包含轻量参数、任务进度和准确率矩阵；任务中断会从当前任务重做。
+
+## 环境与数据
+
+推荐 Linux、Python 3.11、两张 A100 40GB：
 
 ```bash
-git clone -b v2 https://github.com/Lakunsradwfw/SMOPE1.git
-cd SMOPE1
-conda create -n smope-qwen python=3.11 -y
-conda activate smope-qwen
+conda create -n smope-coin python=3.11 -y
+conda activate smope-coin
 bash scripts/qwen/setup.sh
 ```
 
-模型目录默认：
+本地模型默认位于 `pretrained/Qwen3.5-9B/`，必须是
+`Qwen3_5ForConditionalGeneration` 的完整 safetensors 目录，并包含 post-trained 模型的
+`chat_template.jinja`；目录名含 `Base` 会被直接拒绝。CoIN 根目录结构见
+`SMOPEDATAS_CoIN_README.md`，每个任务必须同时存在 `train.json` 和 `test.json`；若评估文件名不同，
+使用 `--eval-split` 指定。
+
+先检查全部数据和 Processor，不加载 9B 权重：
+
+```bash
+python scripts/qwen/check_coin.py \
+  --model-path /absolute/Qwen3.5-9B \
+  --coin-root /absolute/CoIN
+```
+
+## 运行
+
+```bash
+export MODEL_PATH=/absolute/Qwen3.5-9B
+export COIN_ROOT=/absolute/CoIN
+
+# 每种方法只跑 1 条样本，验证真实 9B 前向/反向与 SMoPE 注入
+bash scripts/qwen/run.sh zero_shot preflight
+bash scripts/qwen/run.sh lora preflight
+bash scripts/qwen/run.sh smope preflight
+
+# 每任务少量样本的端到端验证；分数不能作为正式结果
+bash scripts/qwen/run_all.sh smoke
+
+# 三组正式实验
+bash scripts/qwen/run.sh zero_shot full
+bash scripts/qwen/run.sh lora full
+bash scripts/qwen/run.sh smope full
+
+# 相同目录从最近一个已完成任务恢复
+bash scripts/qwen/run.sh smope full --resume
+
+# 多种子；zero-shot 通常只需 seed 0
+SEEDS="0 1 2" bash scripts/qwen/run.sh lora full
+SEEDS="0 1 2" bash scripts/qwen/run.sh smope full
+```
+
+默认任务顺序为论文随机顺序：
 
 ```text
-pretrained/Qwen3.5-9B/
-  config.json
-  model.safetensors.index.json
-  model-00001-of-....safetensors  # 所有分片
-  tokenizer.json
-  tokenizer_config.json
-  preprocessor_config.json
-  chat_template.jinja            # 或模板存于 tokenizer 配置
-  ...                           # 官方仓库其他 processor 配置也一并下载
+ScienceQA, TextVQA, ImageNet, GQA, VizWiz, Grounding, VQAv2, OCRVQA
 ```
 
-建议下载官方 Hugging Face 完整模型目录；不要只放 GGUF 或纯文本模型。
-脚本只读取本地权重，不自动下载、不通过推理 API 训练。
-加载时若提示 `lm_head.weight UNEXPECTED`，这是分类入口不使用语言输出头的正常情况；主干缺失参数会报错。
-若文件直接位于 `pretrained/`，先执行 `export MODEL_PATH="$PWD/pretrained"`。
+可用 `--tasks` 显式修改。正式对比必须让 LoRA 与 SMoPE 使用相同任务顺序、样本、图像预算、
+最大序列长度和生成长度。
 
-数据沿用旧项目格式：
+主要训练设置：BF16、每卡 batch 1、梯度累积 8、每任务 1 epoch、最多 1024 token、
+最多 256 个合并视觉 token。SMoPE 默认 25 专家、Top-5，只注入 8 个 full-attention 层；
+路由由最后 prefix token 与 prefix 均值的可学习混合决定，答案生成期间固定。
 
-```text
-data/cifar-100-python/{train,test,meta}
-data/CUB_200_2011/{images/,images.txt,image_class_labels.txt,train_test_split.txt}
-data/imagenet-r/<类别目录>/<图片>
-```
-
-ImageNet-R 使用仓库 `dataloaders/splits` 的原训练／测试列表。
-可通过 `DATA_ROOT=/absolute/data/root` 指定共同数据根目录。
-启动时检查缺失图片；不会静默下载或重划分测试集。
-
-## 2. 先验证，再正式运行
-
-以下命令均在仓库根目录执行，每次默认占用两张卡；不要同时启动多个实验争抢显存。
+OOM 时依次降低：
 
 ```bash
-# 仅检查官方 Processor 的图片/token 预算，不加载主干权重
-python scripts/qwen/check_processor.py pretrained/Qwen3.5-9B
-
-# 真实模型加载 + 一个图文批次前向/反向，无优化器更新
-bash scripts/qwen/cifar100.sh preflight smope
-
-# 两任务小样本：训练、专家统计、校正、评价、轻量保存
-bash scripts/qwen/cifar100.sh smoke smope
-bash scripts/qwen/cub200.sh smoke smope
-bash scripts/qwen/imagenet-r.sh smoke smope
-
-# 10 个完整增量任务，默认 seed=0
-bash scripts/qwen/cifar100.sh full smope
-bash scripts/qwen/cub200.sh full smope
-bash scripts/qwen/imagenet-r.sh full smope
-
-# 相同类别顺序、相同评价协议的冻结特征对照
-bash scripts/qwen/cifar100.sh full head_only
-bash scripts/qwen/cub200.sh full head_only
-bash scripts/qwen/imagenet-r.sh full head_only
+bash scripts/qwen/run.sh smope smoke --max-length 512 --max-visual-tokens 128
 ```
 
-每个 full 实验默认每任务 20 个训练 epoch；第一个任务另有 10 个初始化 epoch。
-SMoPE 在初始化时使用全部专家，head_only 同期只训练分类头，以保持分类头优化预算一致。
-每个任务做 5 个特征校正 epoch；smoke 分别缩至 1，并限制每类 2 张训练／测试图片。
-**smoke 分数仅用于功能验证，不能当作正式实验结果。**
+## 输出
+
+默认输出为 `outputs/coin-qwen3.5-9b/<method>/<mode>/seed-<seed>/`：
+
+- `environment.json`：参数、版本、GPU、模型配置和权重索引摘要。
+- `dataset_manifest.json`：实际读取的指令文件、大小、修改时间和样本数。
+- `events.jsonl`：训练损失、学习率、耗时与峰值显存。
+- `predictions/<stage>/<task>.jsonl`：原始答案、参考答案、解析结果和样本得分。
+- `accuracy_matrix.csv`：训练到每个阶段后，所有已见任务的 CoIN task accuracy。
+- `summary.json`：最终平均准确率、MAA、New.ACC、BWT 和 forgetting；zero-shot 只报告各任务和平均值。
+- `routing/*.json`：SMoPE 每层/每头频次、覆盖率、熵、保护状态、路由混合系数和温度。
+- `latest_adapter.pt`：唯一保留的轻量恢复文件，不含基础模型。
+
+汇总多次运行：
 
 ```bash
-# 多种子依次运行；训练参数直接追加在脚本后
-SEEDS="0 1 2" bash scripts/qwen/cifar100.sh full smope --epochs 20
-
-# Top-k 消融使用不同目录，避免覆盖
-OUTPUT_ROOT=outputs/qwen-top3 bash scripts/qwen/cifar100.sh full smope --topk 3
-
-# 恢复原实验：同一输出路径、世界大小、种子和训练参数
-bash scripts/qwen/cifar100.sh full smope --resume
-
-# Linux 上 DataLoader 多进程使用 forkserver，避免 CUDA 初始化后的 fork
-bash scripts/qwen/cifar100.sh full smope --workers 1 --worker-start-method forkserver
-
-# 若 forkserver 与环境中的第三方库不兼容，可改用隔离更彻底但启动更慢的 spawn
-bash scripts/qwen/cifar100.sh full smope --workers 1 --worker-start-method spawn
-
-# 单卡调试。DDP 每卡一份主干，两张 40GB 不等于一张 80GB
-NPROC_PER_NODE=1 CUDA_VISIBLE_DEVICES=0 OUTPUT_ROOT=outputs/qwen-single \
-  bash scripts/qwen/cifar100.sh smoke smope
+python scripts/qwen/summarize.py outputs/coin-qwen3.5-9b
 ```
 
-默认每卡 batch=1、梯度累积 8 次、有效 batch=16；BF16 主干、FP32 专家和分类头，非重入梯度检查点。
-图像保持纵横比，最多 256 个合并后的视觉 token；原图片不会被提前按 ViT 方式归一化。
-OOM 时减小 `--max-visual-tokens 128`，用新的输出目录运行，勿混合不同分辨率结果。
-预检仅代表该输入批次通过，不能保证所有后续输入／阶段绝不 OOM。
+## 适配边界
 
-默认采用兼容性优先的 PyTorch 注意力实现；没有 `flash-linear-attention` / `causal-conv1d` 时，
-Qwen 线性注意力会提示使用较慢的 PyTorch fallback。先完成 smoke 验证，再在独立环境验证加速内核；
-不要在一组对比实验中途切换内核。完整训练耗时需以服务器实测为准。
-
-## 3. 实验定义与方法适配
-
-| 配置 | 主干 | 可训练部分 | 专家 |
-|---|---|---|---|
-| head_only | 冻结完整视觉—语言 Qwen | 分类头 | 无 |
-| smope | 冻结完整视觉—语言 Qwen | 分类头 + K/V Prompt | 每 Q 头 25，Top-5 |
-
-- 两者输入都是图片和固定指令 `Classify this image.`，不注入标签、候选类别或 task id。
-- 取最后一个有效输入 token 的最终隐藏特征分类，不调用 `generate` 或语言输出头。
-- 从模型配置识别完整注意力层；标准 9B 是零起始编号 3/7/11/15/19/23/27/31。
-- 保留 Q/K norm、RoPE、GQA 原 K/V 共享、输出 gate 和投影；GQA 扩展后每 Q 头有独立专家。
-- Prompt 是 RoPE 后的位置无关记忆。有效 token 的平均 Q 决定 Top-k，沿用 SMoPE 的共享 prompt 分数。
-  普通 token 分数仍有因果掩码，但全输入路由不是严格自回归，禁止 KV cache / 生成。
-- 首任务先 dense 初始化，然后 Top-k 训练；旧专家约束、使用频次、当前任务训练类别屏蔽保留。
-- 所有评价只在**已见类别全集**中分类，不利用测试 task id 限定候选类别。
-- 每个任务结束扫描当前任务训练图片；精确分片后汇总专家频次和每类特征统计，不使用旧原始图片。
-- **明确适配差异：** 4096 维特征的全协方差开销较大，因此采用对角方差高斯特征采样校正分类头。
-  老类保留其当时特征统计；两种 Qwen 配置使用相同校正规则。不是声称逐项复现 ViT 超参数。
-- 默认 prompt/head LR 均为 1e-3，路由／旧专家损失权重各 1e-5、epsilon=0.4，AdamW、余弦衰减。
-  这是启动配置而非已调优结果。`--correction-epochs 0` 可禁用校正，需为两种方法使用相同设置。
-- 类别顺序遵循旧代码的 Python seeded shuffle；完整任务分别为 10×10、10×20、10×20。
-  Qwen 使用确定性图片预处理，不沿用 ViT 随机裁剪；日志记录该差异，跨主干对比需说明预处理和预训练数据不同。
-
-## 4. 复盘产物：不保存完整主干
-
-默认目录 `outputs/qwen/<数据集>/<方法>/<模式>/seed-<种子>/`：
-
-| 文件 | 内容 |
-|---|---|
-| environment.json | 配置、类别顺序、模型 config/index 摘要、Git 提交、软件/GPU信息 |
-| events.jsonl | 分步骤／epoch 损失、LR、梯度范数、吞吐量、各阶段耗时、每卡峰值显存 |
-| accuracy_matrix.csv | 行：训练到哪个任务；列：各测试任务准确率；未见任务留空 |
-| summary.json / report.md | 最终平均准确率、过程平均准确率、遗忘率、后向迁移 |
-| per_class_task_N.json | 原始／映射类别 ID、样本数、正确数、分类准确率 |
-| confusion_task_N.npy | 各任务结束时的混淆矩阵 |
-| experts_task_N.json | 每层每头累计选择频次、覆盖率、熵和已保护专家标记 |
-| latest_adapter.pt | 仅最新轻量专家、分类头、任务状态、对角原型及恢复所需优化器/RNG |
-
-不复制基础模型，不保留逐任务完整权重；恢复时重新读取 `MODEL_PATH` 的同一套基础权重。
-检查点为 **epoch 边界恢复**：中断后重做未完成 epoch；任务后处理若中断会从最后训练 epoch 重做。
-日志保留历史尝试，复盘时间包含重试开销。只加载自己生成的可信 `.pt` 文件。
-基础权重标识记录配置、分片索引摘要，未逐字节散列 9B 权重；恢复时须保证权重目录没有被替换。
-
-训练样本在 DDP 尾部可能补齐少量重复项，训练统计明确包含补齐项；评价、专家扫描和原型统计使用不重复分片。
-准确率单位为百分数；遗忘率和 BWT 单位为百分点；首任务遗忘率和 BWT 定义为 0。
-
-```bash
-python scripts/qwen/summarize.py outputs/qwen
-```
-
-生成 `comparison.csv` 和 `comparison.md`。比较时保持所有训练参数、图像预算和任务划分一致；
-不同自定义超参数用不同 `OUTPUT_ROOT`，不要把不一致配置的结果放在同一多种子汇总组。
-
-## 5. 验证边界
-
-本仓库提供无需下载权重的真实 Qwen 小配置测试，包括图文前向／反向、梯度检查点、padding、
-专家状态恢复，以及两进程 CPU/Gloo 的同步、统计、评价和断点测试。
-这不等于已在完整 Qwen3.5-9B / A100 / NCCL 上验证；服务器 `preflight` 和 `smoke` 是必需的交付验证步骤。
-`setup.sh` 锁定 Linux CUDA PyTorch 与 Transformers 版本；本地 CPU 的 PyTorch 版本可能不同。
-
-官方结构依据：
-- https://huggingface.co/Qwen/Qwen3.5-9B
-- https://github.com/huggingface/transformers/blob/v5.3.0/src/transformers/models/qwen3_5/modeling_qwen3_5.py
+- 语言损失只监督最后一个 assistant 答案，路由只能读取图像与用户 prefix，杜绝答案泄漏。
+- LoRA 与 SMoPE 均冻结视觉塔、Qwen 主干及 LM Head。
+- 取消原分类版线性头、类别高斯原型和分类器校正；这些机制不适用于开放生成。
+- Grounding 使用坐标 IoU>0.5；ScienceQA 解析选项字母；ImageNet 采用官方类别字符串包含判断；
+  GQA、VizWiz、VQAv2、OCRVQA 使用忽略大小写的精确答案匹配。
+- TextVQA 会从 `cl_dataset/TextVQA/TextVQA_0.5.1_{split}.json` 读取 10 个标注答案并使用
+  官方软准确率；当 `test` 指令实际对应官方 `val` 时会自动回退到 val 标注。若找不到多答案标注，
+  会退化为单答案精确匹配，并在逐样本预测的 `references` 中清楚体现。
+- evaluator 是对 CoIN 官方任务脚本的仓库内可审计实现。原始生成文本、全部 reference 和解析结果
+  都会保存，因此可另跑官方 evaluator 复核而不覆盖本实验结果。

@@ -202,6 +202,10 @@ curl -L -C - -o vit_base_patch16_224_augreg2_in21k_ft_in1k.bin "https://hf-mirro
 curl -L -C - -o ibot_vit_base16.pth "https://lf3-nlp-opensource.bytetos.com/obj/nlp-opensource/archive/2022/ibot/vitb_16/checkpoint_teacher.pth"
 curl -L -C - -o dino_vitbase16_pretrain.pth "https://dl.fbaipublicfiles.com/dino/dino_vitbase16_pretrain/dino_vitbase16_pretrain.pth"
 
-MODEL_PATH=pretrained/Qwen3.5-9B-Base \
-PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 \
-bash scripts/qwen/cifar100.sh smoke smope
+# CoIN generative runs use the post-trained multimodal model, never the Base checkpoint.
+MODEL_PATH=pretrained/Qwen3.5-9B COIN_ROOT=/absolute/path/to/CoIN \
+  bash scripts/qwen/run_all.sh smoke
+
+# Full zero-shot, sequential LoRA, and SMoPE comparison:
+MODEL_PATH=pretrained/Qwen3.5-9B COIN_ROOT=/absolute/path/to/CoIN \
+  bash scripts/qwen/run_all.sh full

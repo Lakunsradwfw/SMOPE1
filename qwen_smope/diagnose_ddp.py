@@ -46,6 +46,8 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=25)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--accumulation", type=int, default=2)
+    parser.add_argument("--global-batch-size", type=int, default=None,
+                        help="可选的受控对照断言；必须等于 batch*accumulation*WORLD_SIZE")
     parser.add_argument("--max-length", type=int, default=1024)
     parser.add_argument("--max-visual-tokens", type=int, default=256)
     parser.add_argument("--length-bucket", type=int, default=128)
@@ -74,12 +76,27 @@ def _timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def validate_global_batch(args: argparse.Namespace, world: int,
+                          variant: str | None = None) -> int:
+    # Independent processes do not form one optimizer/global batch.
+    multiplier = 1 if variant == "multiprocess-independent" else world
+    effective = args.batch_size * args.accumulation * multiplier
+    if args.global_batch_size is not None and args.global_batch_size != effective:
+        raise ValueError(
+            f"Expected global batch {args.global_batch_size}, got {effective} "
+            f"({args.batch_size}*{args.accumulation}*{multiplier})")
+    return effective
+
+
 def main(argv: list[str] | None = None) -> None:
     args = arguments(argv)
     rank = int(os.getenv("RANK", "0"))
     world = int(os.getenv("WORLD_SIZE", "1"))
     local_rank = int(os.getenv("LOCAL_RANK", "0"))
     validate_variant_world(args.variant, world)
+    effective_global_batch = validate_global_batch(args, world, args.variant)
+    batch_size_scope = ("per_process" if args.variant == "multiprocess-independent"
+                        else "global")
     if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
         raise RuntimeError("The DDP diagnostic requires a BF16-capable CUDA GPU")
     torch.cuda.set_device(local_rank)
@@ -105,7 +122,7 @@ def main(argv: list[str] | None = None) -> None:
         processor, args.max_length, args.max_visual_tokens, fetcher, bucket=args.length_bucket)
     dataset = CoINDataset(
         args.coin_root, args.task, args.train_split, 0,
-        verify_images=args.image_transport == "mount")
+        verify_images=False)
     if rank == 0:
         manifest, cache_path, _ = ensure_filter_manifest(
             dataset, collator, args.filter_cache, processor_path,
@@ -139,6 +156,8 @@ def main(argv: list[str] | None = None) -> None:
     optimizer.zero_grad(set_to_none=True)
     iterator = iter(loader)
     run_started = _sync_cuda(device)
+    samples_seen = 0
+    optimizer_updates = 0
 
     try:
         for index in range(args.steps):
@@ -169,6 +188,7 @@ def main(argv: list[str] | None = None) -> None:
                     [parameter for parameter in model.parameters() if parameter.requires_grad], 1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                optimizer_updates += 1
                 optimizer_finished = _sync_cuda(device)
                 optimizer_seconds = optimizer_finished - optimizer_started
             row = {
@@ -189,6 +209,7 @@ def main(argv: list[str] | None = None) -> None:
                 "monotonic_seconds": time.perf_counter() - run_started,
             }
             append_jsonl(trace_path, row)
+            samples_seen += len(batch["metadata"])
     except Exception as error:
         append_jsonl(trace_path, {"type": "error", "variant": args.variant,
                                   "rank": rank, "error": repr(error),
@@ -198,14 +219,37 @@ def main(argv: list[str] | None = None) -> None:
         raise
     finally:
         elapsed = _sync_cuda(device) - run_started
-        append_jsonl(trace_path, {"type": "summary", "variant": args.variant,
-                                  "rank": rank, "steps": args.steps,
-                                  "timestamp_utc": _timestamp(),
-                                  "wall_seconds": elapsed,
-                                  "filter_manifest": str(cache_path)})
+        summary = {"type": "summary", "variant": args.variant,
+                   "rank": rank, "steps": args.steps,
+                   "timestamp_utc": _timestamp(), "wall_seconds": elapsed,
+                   "samples_seen": samples_seen, "optimizer_updates": optimizer_updates,
+                   "effective_global_batch_size": effective_global_batch,
+                   "batch_size_scope": batch_size_scope,
+                   "filter_manifest": str(cache_path)}
+        try:
+            state_stats = torch.zeros(2, dtype=torch.float64, device=device)
+            nonfinite_parameters = 0
+            with torch.no_grad():
+                for parameter in model.parameters():
+                    if not parameter.requires_grad:
+                        continue
+                    value = parameter.detach().float()
+                    nonfinite_parameters += int((~torch.isfinite(value)).sum().item())
+                    state_stats[0] += value.sum().double()
+                    state_stats[1] += value.square().sum().double()
+            summary.update({
+                "trainable_parameter_sum": float(state_stats[0]),
+                "trainable_parameter_l2": float(state_stats[1].sqrt()),
+                "nonfinite_trainable_parameters": nonfinite_parameters,
+            })
+        except Exception as state_error:
+            summary["trainable_state_error"] = repr(state_error)
+        append_jsonl(trace_path, summary)
         if rank == 0:
             write_json(output / "configuration.json", {
                 "arguments": vars(args), "world_size": world,
+                "effective_global_batch_size": effective_global_batch,
+                "batch_size_scope": batch_size_scope,
                 "filter_manifest": str(cache_path),
                 "torch_distributed_debug": os.getenv("TORCH_DISTRIBUTED_DEBUG"),
                 "nccl_debug": os.getenv("NCCL_DEBUG"),

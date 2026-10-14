@@ -92,6 +92,8 @@
 | 2026-10-14 18:41:09 +08:00 | 同上 | `qwen_smope/filtering.py`, `qwen_smope/prepare_data.py` | 完整 split 过滤、配置签名缓存、原子写入、剔除率分级与高比例门禁 | 缓存命中/失效、分级单测 | 全量扫描成本待测 |
 | 2026-10-14 18:41:09 +08:00 | 同上 | `qwen_smope/diagnose_ddp.py` | 新增 A/B/C/D 诊断；每 rank 独立 JSONL，分段 CUDA 同步计时 | 参数与 world-size 单测、语法编译 | 诊断同步本身会扰动绝对吞吐，仅用于定位 |
 | 2026-10-14 18:41:09 +08:00 | 同上 | `tests_qwen/test_qwen.py` | 覆盖过滤先于采样、`524377`、缓存、全局 batch、URL、trace 合约 | 28 项单测通过 | 无 CUDA 集成测试 |
+| 2026-10-14 | `5ed8a62` + 未提交修改 | `qwen_smope/train.py`, `tests_qwen/test_qwen.py`, 本文与 `QWEN_SERVER.md` | route scan 从生成评测 batch=1 解耦，默认使用训练 batch=4；正式实验改为双卡独立 run，增加评测预算门禁与 ETA | 32/32 单测、compileall、diff check | batch 1/4 路由频次等价性与实际加速待 H100 短标定 |
+| 2026-10-15 | 基于 `5ed8a62` 的本次 smoke-speed 提交 | `qwen_smope/{data,filtering,prepare_data,train,model,diagnose_ddp}.py`, `tests_qwen/test_qwen.py`, 本文与 `QWEN_SERVER.md` | 缺图分级与重试、分片过滤缓存、批量评测、确定性有限 route scan、checkpointing 对照开关及服务器逐步判据 | 34/34 单测、compileall、diff check | H100 上 T/E/R/C 各阶段均待验证；提交后在下一条记录补充精确 SHA |
 
 本地验证环境没有可容纳 9B 模型的 GPU，也没有服务器 CoIN 数据，所以没有伪造 smoke/DDP
 完成结果。已执行：
@@ -101,7 +103,7 @@ python -m compileall -q qwen_smope tests_qwen scripts/qwen
 python -m unittest discover -s tests_qwen -p 'test_*.py' -v
 ```
 
-结果：语法编译通过，28/28 单测通过。
+历史首轮结果为 28/28；随着本轮新增覆盖，最新提交前结果为语法编译通过、34/34 单测通过。
 
 ## 3. 当前 CLI 与产物
 
@@ -111,6 +113,15 @@ python -m unittest discover -s tests_qwen -p 'test_*.py' -v
 - `--global-batch-size` 默认 16，`--batch-size` 默认 4。未写 `--accumulation` 时：单卡推导为
   4，双卡推导为 2。若不能整除或显式值不一致，启动前报错。
 - `--workers` 未指定时，preflight/smoke 为 0，full 为 4。
+- `--routing-scan-batch-size` 默认复用训练 `--batch-size`（当前为 4）。路由扫描只做带 mask
+  的前向，不受生成侧 `--eval-batch-size=1` 的限制；可显式设为 1 做服务器等价性复核。
+- `--eval-batch-size` 现在允许大于 1，评测 collator 会临时使用 decoder-only 生成所需的左填充，
+  随后恢复训练侧右填充。默认仍为 1，批量生成在通过 H100 预测等价性验证前不写成已确认加速。
+- `--routing-scan-seed` 默认 42；当 `--routing-scan-samples` 非零时，从完整过滤后任务集做固定
+  随机排列的前 N 条再恢复 source 顺序；因此同 seed 的 N=1000 是 N=5000 的真子集，不再取
+  原数据的有偏前缀。routing JSON 记录数量、seed 和
+  source-index SHA256。
+- gradient checkpointing 默认开启；`--no-gradient-checkpointing` 仅用于 H100 显存/吞吐对照。
 - 图像默认 HTTP，长度桶默认 128；未升级 torch/Triton/FLA，也未启用 DDP bucket、
   static graph 或 autotune monkey-patch。
 
@@ -140,8 +151,13 @@ python -m qwen_smope.prepare_data \
   --coin-root /mnt/zq/SMOPE/coin_local \
   --image-transport http \
   --filter-cache outputs/coin-qwen3.5-9b/_filter_cache \
-  --max-length 1024 --max-visual-tokens 256 --length-bucket 128
+  --max-length 1024 --max-visual-tokens 256 --length-bucket 128 \
+  --scan-workers 8
 ```
+
+`--scan-workers` 默认 8；HTTP 通道硬限制为不超过 14，避免重现 §8.4 的 WebDAV 拥塞。
+每个连续 source-index 分片会原子写入 `_filter_cache/.parts/`，中断后复用已完成分片；最终合并
+前检查签名、覆盖范围、顺序、重复和遗漏，合并产物与单进程入口字节等价。
 
 必须在继续训练前检查每个任务打印的 `excluded_rate`，并直接查看缓存 JSON 中
 `excluded_samples`。VQAv2 的 `524377` 若未出现，应停止并核对数据版本、processor 与长度配置，
@@ -407,3 +423,261 @@ D 的 1.24×T1 也远低于 2× 判据。
 `filter_merge.py`（合并，`--unmeasured-policy fail|exclude`，默认 fail）、
 `probe_missing_images.py`（缺图探测）、`run_ddp_tree.sh`（A/B/C/D）、
 `analyze_ddp.py`（判据汇总）。合并逻辑已对照官方入口做字节等价验证（§8.3.1）。
+
+## 9. 维护者分析与代码化决策（2026-10-14 23:37:07 +08:00）
+
+本节是读取 §8 的服务器结论后，在 GitHub `v2` 提交 `5ed8a62` 基础上做出的维护决策；改动
+尚需在服务器复核，不把本地单测等同于 H100 实测。
+
+### 9.1 已采纳并实现
+
+1. **永久缺图进入正式过滤语义**：HTTP 404/410 或 mount 上确定不存在的图片记录为
+   `reason: image_unavailable`，保留 task、sample_id、source_index、HTTP 状态和位置。
+   因真实视觉 token 无法在缺图时计算，三个长度字段明确为 `null`，不得伪造文本侧长度。
+2. **瞬时故障不得污染数据集**：socket/HTTP 异常及 408/425/429/5xx 最多尝试 4 次，单次
+   timeout 30 秒并指数退避；全部失败后让扫描失败。只有永久 404/410 才能成为剔除记录。
+3. **分片扫描正式入库**：`prepare_data` 默认 8 个 spawn 进程，HTTP 最大 14；连续分片原子落盘、
+   可断点复用，并在确定性合并前验证分片签名及完整覆盖。训练仍可直接读取现有 8 份缓存，
+   不会因为实现入库而强制重扫。
+4. **缓存验证加固**：命中 manifest 时验证有效/剔除 index 有序、唯一、不相交且恰好覆盖完整
+   source split，避免损坏或错误合并的缓存静默进入训练。
+
+### 9.2 明确不采纳或延期
+
+- **暂不实现 DDP 同序桶宽预热**：D 比 A 多 14.3 秒但仍通过预设 2× 判据；这是一轮进程内
+  autotune 的一次性成本。诊断没有保持单/双卡相同有效全局 batch，也没有正式八任务吞吐，
+  当前不足以证明预热能改善总训练时间。先保留单卡默认。
+- **不升级 torch/Triton/FLA，不启用 static graph、bucket 调参或 autotune monkey-patch**：
+  当前快路径正常，DDP 数量级变慢未复现，修改依赖栈会引入更大的数值与兼容性变量。
+- **不删除原始 prediction 中的 `</think>`**：评分器的 `final_answer()` 已在所有任务解析前剥离
+  该前缀；保留原始文本便于审计。需要用更大评测样本确认准确率，而不是改变生成路径掩盖现象。
+- **不实现 microbatch 级恢复**：协议本来是任务边界 checkpoint，任务内中断重跑。先补两任务
+  小样本的任务边界恢复测试，避免把 checkpoint 粒度扩展成新的研究变量。
+
+### 9.3 本地验证与服务器复核项
+
+本轮新增单测覆盖：永久缺图审计、瞬时错误不被吞掉、503 后成功重试、404 不重试、分片合并与
+单进程 manifest 字节等价、HTTP 并发上限。代码健壮性的服务器复核应只改扫描实现：用现有缓存
+确认训练不重扫；另选一个小任务在独立临时缓存目录以 `--scan-workers 8` 重建，验证分片复用和
+最终 SHA。不要删除现有正式缓存。
+
+若要独立审计 §8.7 并决定未来是否预热，需要下载
+`outputs/coin-qwen3.5-9b/verify-20261014/ddp/`（尤其 `summary.json` 与所有 `rank-*.jsonl`）和
+`outputs/coin-qwen3.5-9b/_filter_cache/`。仅继续常规单卡正式实验时，这些原始产物不阻塞。
+
+### 9.4 恢复双卡默认前缺少的严格吞吐对照
+
+§8.7 的 A 固定 accumulation=2，因此单卡有效全局 batch=8；D 的双卡有效全局 batch=16。
+它们用于定位机制是有效的，但不能证明双卡在相同训练协议下更快。下一轮应使用同一批前 1600 个
+有效样本、全局 batch=16、100 次 optimizer update：单卡 400 microbatch、accumulation=4；
+双卡每 rank 200 microbatch、accumulation=2。新 CLI 的 `--global-batch-size 16` 是断言，配置
+不一致会直接失败；summary 记录每 rank 样本数、更新数和有效全局 batch。
+同时记录可训练参数的 sum、L2 norm 与非有限值计数，用于检查两 rank 一致性及 E/F 训练结果漂移。
+
+按“一次一条命令”纪律，先运行 E 并回传产物：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m qwen_smope.diagnose_ddp \
+  --variant single --output outputs/coin-qwen3.5-9b/verify-20261014/ddp/E-single-gbs16 \
+  --model-path /dev/shm/qwen35-9b --coin-root /mnt/zq/SMOPE/coin_local \
+  --image-transport http --filter-cache outputs/coin-qwen3.5-9b/_filter_cache \
+  --steps 400 --batch-size 4 --accumulation 4 --global-batch-size 16
+```
+
+确认 E 完成、`samples_seen=1600`、`optimizer_updates=100` 后才运行 F：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  -m qwen_smope.diagnose_ddp \
+  --variant ddp-sharded --output outputs/coin-qwen3.5-9b/verify-20261014/ddp/F-ddp-gbs16 \
+  --model-path /dev/shm/qwen35-9b --coin-root /mnt/zq/SMOPE/coin_local \
+  --image-transport http --filter-cache outputs/coin-qwen3.5-9b/_filter_cache \
+  --steps 200 --batch-size 4 --accumulation 2 --global-batch-size 16
+```
+
+判据预先固定：F 两 rank 的样本 ID 并集必须与 E 完全一致且无重复，均为 100 次 update；F 最慢
+rank 墙钟必须严格小于 E，loss 和可训练参数统计无异常，才说明双卡有吞吐收益。若只快几秒，考虑到正式训练的
+复杂度和额外故障面，仍保持单卡默认；只有优势稳定且明显时才继续正式多任务 smoke。
+
+### 9.5 正式实验启动决策与时长风险（2026-10-14）
+
+读取下载到本地的 `verify-20261014/`、8 份正式 manifest 和逐 rank JSONL 后，决定**不把 E/F
+作为正式实验的前置门槛**。原因是正式矩阵包含 LoRA、SMoPE 和多个 seed；B 阶段已经证明两张
+H100 各跑一个独立单卡进程没有资源竞争（最慢 rank 53.5s，小于 A 的 58.5s）。因此正式 sweep
+优先把两个独立 run 分配到两张卡，而不是让两张卡同步一个 DDP run。E/F 只用于将来考虑恢复
+DDP 默认值，不阻塞单卡正式协议。
+
+不过仍不能直接用当前默认参数启动 full，存在两个已量化的时长风险：
+
+1. `--max-eval-samples=0` 表示全量留出集。一个训练方法的 36 个矩阵单元共生成 **800,935**
+   条；zero-shot 为 **346,437** 条。单 seed 的 zero-shot + LoRA + SMoPE 合计 **1,948,307**
+   次生成，按 smoke 的 4 条 VQAv2/3.57s 粗略外推已经是按周计，不能把它写成可接受的默认时长。
+2. 旧实现把 SMoPE 路由扫描错误地绑在 `eval_batch_size=1`，每个 seed 额外做 570,260 个单样本
+   前向。现改为独立 `--routing-scan-batch-size`，默认 4。该改动在数学上保持每条样本及 attention
+   mask 不变，但 H100 上的频次 JSON 等价性和加速比仍标为**待验证**，不能把理论加速写成实测。
+
+正式启动前只做两项短标定，不再重跑 A/B/C/D：
+
+- route scan：同一 seed、同 400 条 ScienceQA，分别 batch 1 与 4；要求 routing JSON 中的整数
+  频次、protected 状态完全一致、无非有限值，并预先规定 `T_batch4 <= 0.8 * T_batch1`；否则
+  保留可配置入口但把正式默认值退回 1。
+- evaluation：zero-shot、8 任务、每任务 100 条，测各任务真实 `samples/s`。据此再冻结论文使用的
+  `--max-eval-samples`；这个值必须在所有方法、seed、轮次一致，不能跑到一半修改。
+
+在服务器标定前只能给区间，不给伪精确 ETA。若冻结 `max_eval_samples=1000`、3 个训练 seed、
+zero-shot 只跑 seed 0，并用两张 H100 并行独立单卡作业，当前证据支持的保守墙钟预算为
+**4–7 天**；只跑一个 seed 约 **1.5–2.5 天**。若保持全量评测（0），三 seed 很可能升到
+**数周**。标定完成后应用实测 train/route/eval 吞吐重算并记录最终 ETA。
+
+### 9.6 单 seed 24 小时目标：优化顺序与不可混淆的变量（2026-10-15）
+
+读取 A–D trace 后，**不建议仅增大 global batch**。A 的 optimizer 总耗时仅 0.100s/58.486s
+（0.17%）；在每卡 batch 仍为 4 时，把 global batch 16 改为 32 只是把极小的 optimizer 次数
+再减半，所有样本的 forward/backward 仍会执行，并会改变优化协议和学习率语义。
+
+正确的第一优先级是增大每卡物理 batch、同步降低 accumulation，保持 global batch=16：
+
+| 每卡物理 batch | accumulation | global batch | 协议判断 |
+|---:|---:|---:|---|
+| 4 | 4 | 16 | 当前基线 |
+| 8 | 2 | 16 | 第一候选 |
+| 16 | 1 | 16 | H100 显存允许时的目标 |
+
+虽然三者每次 optimizer update 都含 16 条样本，但当前 loss 是“microbatch 内 token 均值再按
+microbatch 等权累积”，所以不同物理 batch 不保证逐 bit 相同；必须在正式实验前冻结一个设置，
+LoRA/SMoPE/所有 seed 共用，不能中途切换。
+
+为了把单 seed 压到 24 小时，按下面顺序只改一个变量并预先固定判据：
+
+1. **训练物理 batch**：同一 GQA 1600 样本依次测 4/8/16，global batch 固定 16。要求无 OOM、
+   非有限值或样本遗漏，峰值 allocated <72GiB；采用满足条件且训练阶段最快的设置，候选相对
+   batch=4 至少快 20%。不要用增大 global batch 冒充吞吐提升。
+2. **批量生成**：同一 zero-shot 8×100 固定评测集对照 eval batch 1/4，batch 4 必须拥有完全
+   相同的 sample ID、解析后 final answer 和 score，且总评测时间至少缩短 30%；通过后再试 8。
+   原始字符串若不同但解析答案相同仍需保留 diff，不能静默忽略。
+3. **有限 route scan**：建议候选为每任务固定随机 5000 条、seed=42，而不是全量 570,260 条。
+   这是 SMoPE 算法口径变化，不是纯工程等价优化；必须比较 1000/5000/全量（或尽可能大的参考）
+   推导出的 `frequency >= positive-frequency mean` 保护集合。5000 与参考至少 99.5% 一致才采用，
+   否则提高到 10000 或保留全量，并在论文披露采样数和 seed。
+4. **关闭 gradient checkpointing**：仅在上述物理 batch 确定后单独测。要求峰值 <72GiB、无 OOM，
+   且训练阶段至少再快 15% 才采用；否则保持默认开启。
+
+若物理 batch=8/16、eval batch=4、route scan=5000 均通过，`max_eval_samples=1000` 的单 seed
+目标预计可降到 **约 16–24 小时**（两张 H100 分别并行 LoRA 与 SMoPE）；这是待 H100 标定的
+预算，不是完成结果。若任一项未通过，优先保证协议和预测一致性，而不是为了命中 24 小时改大
+global batch 或减少训练样本。
+
+### 9.7 给服务器 DeepSeek 的逐步执行单（2026-10-15，当前均待验证）
+
+本节是服务器 agent 的直接入口。**不要从“正式命令”开始，也不要一次跑完所有候选。**每阶段只
+运行当前要求的一条命令，保存原始产物并回传判据结果；维护者确认后才进入下一阶段。A–D 的旧
+DDP 诊断已经回答根因问题，本轮不重跑，也不启用 DDP、同序预热、static graph 或依赖升级。
+
+#### 9.7.1 前置检查与统一纪律
+
+```bash
+cd /mnt/zq/SMOPE
+source .venv2/bin/activate
+git status --short
+git log -1 --oneline
+nvidia-smi
+```
+
+要求：工作区干净；HEAD 是 GitHub `v2` 最新的 smoke-speed 提交；两张 H100 无其他进程；模型
+`/dev/shm/qwen35-9b` 完整；8 份缓存仍在 `outputs/coin-qwen3.5-9b/_filter_cache/`。本轮只能复用
+缓存，禁止删除或重扫。所有标定固定 GPU0，GPU1 保持空闲，避免把并发调度收益混入单变量比较。
+
+每条命令都应额外保存：stdout/stderr、运行前后 `nvidia-smi`、对应 `environment.json`、
+`events.jsonl`、`dataset_manifest.json`、routing/predictions，以及 `git rev-parse HEAD`。若出现 OOM，
+记录后回退物理 batch；**不要降低 max-length、视觉 token 或训练样本来制造“通过”**。
+
+#### 9.7.2 阶段 T：训练物理 batch（先 T4，再 T8；T8 通过后才跑 T16）
+
+T4 控制组：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+OUTPUT_ROOT=outputs/coin-qwen3.5-9b/verify-20261015/train-b4 \
+bash scripts/qwen/run.sh smope smoke \
+  --tasks GQA --max-train-samples 1600 \
+  --batch-size 4 --global-batch-size 16 \
+  --eval-batch-size 1 --max-eval-samples 4 \
+  --routing-scan-samples 1 --routing-scan-batch-size 1 \
+  --workers 0
+```
+
+T8 只改变物理 batch（accumulation 自动从 4 变为 2）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+OUTPUT_ROOT=outputs/coin-qwen3.5-9b/verify-20261015/train-b8 \
+bash scripts/qwen/run.sh smope smoke \
+  --tasks GQA --max-train-samples 1600 \
+  --batch-size 8 --global-batch-size 16 \
+  --eval-batch-size 1 --max-eval-samples 4 \
+  --routing-scan-samples 1 --routing-scan-batch-size 1 \
+  --workers 0
+```
+
+先回传 T4/T8，确认 T8 无 OOM/非有限值/样本遗漏、两个训练阶段 update 语义一致、峰值
+allocated <72GiB，且 `(dense+sparse)_T8 <= 0.8 * (dense+sparse)_T4`。只有全部通过，才把 T8
+命令的输出目录和 `--batch-size` 改为 `train-b16`/`16`；global batch 仍为 16，accumulation
+自动为 1。采用满足显存余量且最快的候选，不因数字更大而自动选 T16。
+
+#### 9.7.3 阶段 E：批量生成（训练 batch 冻结后执行）
+
+E1 基线：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+OUTPUT_ROOT=outputs/coin-qwen3.5-9b/verify-20261015/eval-b1 \
+bash scripts/qwen/run.sh zero_shot full \
+  --eval-batch-size 1 --max-eval-samples 100 \
+  --eval-sample-seed 42 --workers 4
+```
+
+E4 只改变 eval batch：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+OUTPUT_ROOT=outputs/coin-qwen3.5-9b/verify-20261015/eval-b4 \
+bash scripts/qwen/run.sh zero_shot full \
+  --eval-batch-size 4 --max-eval-samples 100 \
+  --eval-sample-seed 42 --workers 4
+```
+
+回传两套 `predictions/**.jsonl` 和 events。要求每个任务样本 ID 集合、`score`，以及任务对应的
+`parsed_prediction` 或 `normalized_prediction` 完全一致，总评测时间 `T_E4 <= 0.7*T_E1`，无
+padding warning、异常或 OOM。原始 `prediction` 若有任何差异也要报告并保留 diff。E4 通过后
+才可按相同方法尝试 E8；若 E4 不通过，正式设置退回 1。
+
+#### 9.7.4 阶段 R：route scan 工程等价性与采样稳定性
+
+先完成 §9.5 的 ScienceQA 400 条 batch 1/4 对照：routing JSON 必须逐字节一致，且
+`T_batch4 <= 0.8*T_batch1`。然后在已冻结的训练物理 batch 下，对同一任务、同一训练样本和
+seed 分别运行 `--routing-scan-samples 1000`、`5000`、`10000`；`--routing-scan-seed 42` 不变。
+固定随机排列保证 1000 是 5000 的子集、5000 是 10000 的子集。回传三套 routing JSON，由
+维护者根据 `frequency >= positive-frequency mean` 重新计算保护集合；5000 与 10000 一致率
+达到 99.5% 才能把 5000 写入正式协议，否则提高上限。这里不允许 DeepSeek 自行宣布“差不多”。
+
+#### 9.7.5 阶段 C：gradient checkpointing（最后、可选）
+
+复制已经获胜的训练物理 batch 命令，只增加 `--no-gradient-checkpointing` 并换新输出目录。
+峰值 allocated 必须 <72GiB、无 OOM/非有限值，且 dense+sparse 至少再快 15% 才采用；否则保持
+默认开启。不要把关闭 checkpointing 与改变 batch 放在同一次对照中。
+
+#### 9.7.6 状态表与停止条件
+
+| 阶段 | 当前状态 | 通过后冻结 | 未通过行为 |
+|---|---|---|---|
+| T4/T8 | 待验证 | 最快且 <72GiB 的物理 batch | 保持 batch=4 |
+| T16 | 等 T8 通过 | batch=16 或退回 8 | 退回 8，不改 global batch |
+| E1/E4 | 待验证 | eval batch=4；可再试 8 | 退回 1 |
+| route batch 1/4 | 待验证 | routing-scan batch 跟随已冻结物理 batch | 退回 1 |
+| route 1000/5000/10000 | 待验证 | 稳定的最小 N 与 seed=42 | 提高 N 或全量 |
+| no-checkpointing | 等前述参数冻结 | 仅在显存和 15% 判据通过时关闭 | 保持开启 |
+| 单 seed 正式实验 | **禁止启动** | 所有必需项冻结且维护者确认 | 继续标定 |
+
+最终候选（不是授权开跑）为：global batch 16、物理 batch 8/16、eval batch 4、固定评测
+N=1000、route scan N=5000/seed=42、两张卡各跑一个独立单卡方法。所有结果必须先写回本节状态表
+并附原始产物路径；只有维护者确认 ETA <=24h 且语义判据通过，才启动 GPU0 LoRA / GPU1 SMoPE。

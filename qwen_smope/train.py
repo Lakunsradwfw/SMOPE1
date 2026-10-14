@@ -65,7 +65,8 @@ def arguments(argv: list[str] | None = None, world_size: int | None = None) -> a
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--dense-epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--eval-batch-size", type=int, default=1)
+    parser.add_argument("--eval-batch-size", type=int, default=1,
+                        help="生成评测 batch；大于 1 使用左填充，正式采用前须与 batch=1 对照")
     parser.add_argument("--global-batch-size", type=int, default=16)
     parser.add_argument("--accumulation", type=int, default=None,
                         help="默认按 global-batch-size/(batch-size*world-size) 推导")
@@ -79,6 +80,8 @@ def arguments(argv: list[str] | None = None, world_size: int | None = None) -> a
     # 4 线程实测 84 文件/s, 已远超需要。做 smoke 排查时可加 --workers 0 看真实耗时。
     parser.add_argument("--workers", type=int, default=None,
                         help="默认 preflight/smoke=0，full=4")
+    parser.add_argument("--gradient-checkpointing", action=argparse.BooleanOptionalAction,
+                        default=True, help="默认开启；--no-gradient-checkpointing 仅用于 H100 吞吐/显存对照")
     parser.add_argument("--worker-start-method", choices=WORKER_START_METHODS,
                         default=DEFAULT_WORKER_START_METHOD)
     parser.add_argument("--max-length", type=int, default=1024)
@@ -92,6 +95,10 @@ def arguments(argv: list[str] | None = None, world_size: int | None = None) -> a
     parser.add_argument("--max-eval-samples", type=int, default=0)
     parser.add_argument("--eval-sample-seed", type=int, default=42)
     parser.add_argument("--routing-scan-samples", type=int, default=0)
+    parser.add_argument("--routing-scan-seed", type=int, default=42,
+                        help="路由扫描限量时的固定随机采样种子；0 个样本上限表示全量")
+    parser.add_argument("--routing-scan-batch-size", type=int, default=None,
+                        help="路由统计只做前向，默认复用 --batch-size；可设为 1 做逐样本等价性复核")
     parser.add_argument("--filter-cache", default="outputs/coin-qwen3.5-9b/_filter_cache",
                         help="完整训练 split 的确定性长度过滤清单目录")
     parser.add_argument("--allow-high-filter-rate", action="store_true",
@@ -126,10 +133,12 @@ def arguments(argv: list[str] | None = None, world_size: int | None = None) -> a
         parser.error(f"These arguments must be positive: {positive}")
     if args.workers is None:
         args.workers = 4 if args.mode == "full" else 0
+    if args.routing_scan_batch_size is None:
+        args.routing_scan_batch_size = args.batch_size
     if args.topk > args.experts or args.workers < 0 or args.dense_epochs < 0:
         parser.error("Invalid topk/experts/workers/dense-epochs")
-    if args.eval_batch_size != 1:
-        parser.error("Qwen decoder evaluation currently requires --eval-batch-size 1")
+    if args.routing_scan_batch_size <= 0:
+        parser.error("--routing-scan-batch-size must be positive")
     if args.learning_rate is None:
         args.learning_rate = 2e-4 if args.method == "lora" else 1e-3
     world = world_size if world_size is not None else int(os.getenv("WORLD_SIZE", "1"))
@@ -173,11 +182,14 @@ def transfer(value: Any, device: torch.device) -> Any:
     return value
 
 
-def make_loader(dataset, collator, args, rank: int, world: int, train: bool = False):
+def make_loader(dataset, collator, args, rank: int, world: int, train: bool = False,
+                batch_size: int | None = None):
     sampler = (DistributedSampler(dataset, num_replicas=world, rank=rank, shuffle=True, seed=args.seed)
                if train else ExactShard(dataset, rank, world))
     context = args.worker_start_method if args.workers > 0 else None
-    return DataLoader(dataset, batch_size=args.batch_size if train else args.eval_batch_size,
+    effective_batch_size = (batch_size if batch_size is not None
+                            else args.batch_size if train else args.eval_batch_size)
+    return DataLoader(dataset, batch_size=effective_batch_size,
                       sampler=sampler, collate_fn=collator, num_workers=args.workers,
                       pin_memory=True, multiprocessing_context=context), sampler
 
@@ -196,7 +208,9 @@ def prepare_train_dataset(args, task: str, collator: CoINCollator,
                           rank: int, world: int) -> CoINDataset:
     """Filter the complete source split, then take the requested valid prefix."""
     dataset = CoINDataset(args.coin_root, task, args.train_split, 0,
-                          verify_images=args.image_transport == "mount")
+                          # The filter must record permanent missing images in
+                          # its manifest instead of failing during path probing.
+                          verify_images=False)
     processor_path = args.processor_path or args.model_path
     if rank == 0:
         manifest, cache_path, built = ensure_filter_manifest(
@@ -368,11 +382,40 @@ def train_epoch(network, model, loader, sampler, optimizer, scheduler, args,
             "supervised_tokens": int(totals[5]), "samples_with_ddp_padding": int(totals[6])}
 
 
+def routing_scan_indices(length: int, limit: int, seed: int,
+                         task: str, split: str) -> list[int]:
+    """Choose a reproducible source-ordered random subset, never a biased prefix."""
+    if limit <= 0 or limit >= length:
+        return list(range(length))
+    generator = random.Random(f"coin-route-{seed}-{task}-{split}")
+    # One fixed permutation makes the N=1000 subset a true prefix of the
+    # N=5000 subset, so stability tests change sample count without also
+    # changing every selected record.
+    indices = list(range(length))
+    generator.shuffle(indices)
+    return sorted(indices[:limit])
+
+
 @torch.no_grad()
 def scan_routes(model: QwenCoINModel, dataset, collator, args, device, rank, world) -> list[dict]:
-    if args.routing_scan_samples > 0:
-        dataset = Subset(dataset, range(min(len(dataset), args.routing_scan_samples)))
-    loader, _ = make_loader(dataset, collator, args, rank, world, train=False)
+    task, split, original_count = dataset.task, dataset.split, len(dataset)
+    indices = routing_scan_indices(
+        original_count, args.routing_scan_samples, args.routing_scan_seed, task, split)
+    if len(indices) < original_count:
+        dataset = Subset(dataset, indices)
+    scan_metadata = {
+        "sampling": "full" if len(indices) == original_count else "fixed_random",
+        "sample_count": len(indices),
+        "source_count": original_count,
+        "sample_seed": args.routing_scan_seed,
+        "source_indices_sha256": hashlib.sha256(
+            ",".join(map(str, indices)).encode("ascii")).hexdigest(),
+    }
+    # Route observation is a regular masked forward, not autoregressive generation.
+    # Reusing the training batch avoids a full extra pass over every task at
+    # eval_batch_size=1 while preserving the exact sample set and token masks.
+    loader, _ = make_loader(dataset, collator, args, rank, world, train=False,
+                            batch_size=args.routing_scan_batch_size)
     model.eval()
     counts = [torch.zeros_like(expert.frequency) for expert in model.expert_modules()]
     for batch in loader:
@@ -386,7 +429,8 @@ def scan_routes(model: QwenCoINModel, dataset, collator, args, device, rank, wor
         expert.frequency.add_(count)
         frequency = expert.frequency.float()
         probability = frequency / frequency.sum(-1, keepdim=True).clamp_min(1)
-        result.append({"layer": layer, "task_frequency": count.cpu().tolist(),
+        result.append({"layer": layer, "scan": scan_metadata,
+                       "task_frequency": count.cpu().tolist(),
                        "cumulative_frequency": expert.frequency.cpu().tolist(),
                        "coverage": (frequency > 0).float().mean(-1).cpu().tolist(),
                        "entropy": (-(probability * probability.clamp_min(1e-30).log()).sum(-1)).cpu().tolist(),
@@ -535,6 +579,7 @@ def main(argv: list[str] | None = None) -> None:
         model = load_model(
             args.model_path, device, method=args.method, lora_rank=args.lora_rank,
             lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+            gradient_checkpointing=args.gradient_checkpointing,
             experts=args.experts, topk=args.topk, epsilon=args.epsilon,
             router_weight=args.router_weight, old_weight=args.old_weight,
             balance_weight=args.balance_weight, route_mix=args.route_mix,

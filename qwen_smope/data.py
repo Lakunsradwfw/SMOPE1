@@ -13,6 +13,7 @@ from pathlib import Path
 import random
 import re
 import threading
+import time
 from typing import Any, Iterable
 import urllib.parse
 
@@ -139,6 +140,16 @@ class CoINSample:
         return messages
 
 
+class ImageUnavailableError(FileNotFoundError):
+    """A permanent missing-image response that may be audited and filtered."""
+
+    def __init__(self, location: str, status: int | None = None) -> None:
+        self.location = location
+        self.status = status
+        detail = f"HTTP {status} for {location}" if status is not None else f"Missing image: {location}"
+        super().__init__(detail)
+
+
 class ImageFetcher:
     """Loads sample images from the filesystem or straight over HTTP.
 
@@ -150,13 +161,18 @@ class ImageFetcher:
     """
 
     def __init__(self, kind: str = "mount", base_url: str | None = None,
-                 coin_root: str | Path | None = None) -> None:
+                 coin_root: str | Path | None = None, *, timeout_seconds: float = 30,
+                 max_attempts: int = 4) -> None:
         if kind not in ("mount", "http"):
             raise ValueError(f"Unknown image transport: {kind!r}")
         if kind == "http" and not base_url:
             raise ValueError("HTTP image transport needs --image-base-url")
         self.kind = kind
         self.coin_root = Path(coin_root).resolve() if coin_root else None
+        if timeout_seconds <= 0 or max_attempts <= 0:
+            raise ValueError("timeout_seconds and max_attempts must be positive")
+        self.timeout_seconds = timeout_seconds
+        self.max_attempts = max_attempts
         self._local = threading.local()
         if kind == "http":
             parsed = urllib.parse.urlsplit(base_url)
@@ -171,7 +187,8 @@ class ImageFetcher:
         connection = getattr(self._local, "connection", None)
         if connection is None:
             factory = http.client.HTTPSConnection if self.secure else http.client.HTTPConnection
-            connection = self._local.connection = factory(self.host, self.port, timeout=120)
+            connection = self._local.connection = factory(
+                self.host, self.port, timeout=self.timeout_seconds)
         return connection
 
     def __getstate__(self) -> dict[str, Any]:
@@ -199,21 +216,33 @@ class ImageFetcher:
         if not sample.has_image:
             return None
         if self.kind == "mount":
-            return Image.open(sample.image_path).convert("RGB")
+            try:
+                return Image.open(sample.image_path).convert("RGB")
+            except FileNotFoundError as error:
+                raise ImageUnavailableError(str(sample.image_path)) from error
         url = self._url(sample.image_path)
-        for attempt in range(2):
+        transient_statuses = {408, 425, 429, 500, 502, 503, 504}
+        for attempt in range(self.max_attempts):
             try:
                 connection = self._connection()
                 connection.request("GET", url)
                 response = connection.getresponse()
                 body = response.read()
+                if response.status in {404, 410}:
+                    raise ImageUnavailableError(url, response.status)
                 if response.status != 200:
-                    raise FileNotFoundError(f"HTTP {response.status} for {url}")
+                    if response.status not in transient_statuses and response.status < 500:
+                        raise RuntimeError(f"Non-retryable HTTP {response.status} for {url}")
+                    raise http.client.HTTPException(f"HTTP {response.status} for {url}")
                 return Image.open(BytesIO(body)).convert("RGB")
+            except ImageUnavailableError:
+                self._local.connection = None
+                raise
             except (http.client.HTTPException, OSError):
                 self._local.connection = None
-                if attempt:
+                if attempt + 1 == self.max_attempts:
                     raise
+                time.sleep(min(0.5 * 2**attempt, 4.0))
         raise AssertionError("unreachable")
 
 
@@ -622,7 +651,16 @@ class CoINEvalCollator(CoINCollator):
             texts.append(self.processor.apply_chat_template(
                 sample.prompt_messages(sample_images[0] if sample_images else None), tokenize=False,
                 add_generation_prompt=True, enable_thinking=False))
-        inputs = self._encode(texts, images)
+        # Decoder-only batched generation must be left padded: generation
+        # continues from the final column, which is padding for shorter prompts
+        # under the right-padding convention used by supervised training.
+        tokenizer = self.processor.tokenizer
+        original_padding_side = tokenizer.padding_side
+        tokenizer.padding_side = "left"
+        try:
+            inputs = self._encode(texts, images)
+        finally:
+            tokenizer.padding_side = original_padding_side
         return {"inputs": inputs, "router_mask": inputs["attention_mask"].bool(),
                 "metadata": [{"id": s.sample_id, "task": s.task, "answer": s.answer,
                               "references": list(s.references)} for s in batch]}

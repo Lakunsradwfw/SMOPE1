@@ -48,11 +48,14 @@ python -m qwen_smope.prepare_data \
   --model-path /absolute/Qwen3.5-9B \
   --coin-root /absolute/CoIN \
   --image-transport http \
-  --filter-cache outputs/coin-qwen3.5-9b/_filter_cache
+  --filter-cache outputs/coin-qwen3.5-9b/_filter_cache \
+  --scan-workers 8
 ```
 
 逐任务剔除率达到 10% 时，full 会拒绝启动；只有审阅 manifest 后才能显式使用
-`--allow-high-filter-rate`。评测 split 不做该过滤。
+`--allow-high-filter-rate`。评测 split 不做该过滤。HTTP 扫描并发硬限制为 14；分片保存于
+`_filter_cache/.parts/` 并可断点复用。永久 404/410 记为 `image_unavailable`，瞬时超时和 5xx
+只重试、最终失败则中止扫描，不能悄悄算成数据剔除。
 
 ## 运行
 
@@ -100,13 +103,45 @@ ScienceQA, TextVQA, ImageNet, GQA, VizWiz, Grounding, VQAv2, OCRVQA
 
 未显式指定 `--accumulation` 时，单卡自动取 4、双卡自动取 2；不整除或显式值与
 `--global-batch-size` 冲突会拒绝启动。`--workers` 默认 preflight/smoke=0、full=4；继续使用
-HTTP 图片通道和 `--length-bucket=128`。
+HTTP 图片通道和 `--length-bucket=128`。SMoPE 路由统计默认使用
+`--routing-scan-batch-size 4`；它只做前向，不沿用生成评测的 batch 限制。评测支持显式
+`--eval-batch-size 4`，通过左填充进行批量生成，但正式采用前必须按交接文档 §9.6 与 batch=1
+核对 sample ID、解析答案和得分。`--routing-scan-samples N --routing-scan-seed 42` 使用固定随机
+子集而非前缀，并把采样摘要写入 routing JSON。
 
-OOM 时依次降低：
+不要在未指定评测预算时直接启动 full：`--max-eval-samples 0` 是全量评测，一个训练方法的
+持续学习矩阵要生成 800,935 条答案。正式对比必须先固定同一个非零 N，并在所有方法、seed 和
+轮次使用相同的 `--max-eval-samples N --eval-sample-seed 42`。当前建议先按交接文档 §9.5 做
+100 条/任务的短标定，再冻结 N；不要用短标定分数作为正式结果。
+
+增大 global batch 不是主要提速手段：保持 `--global-batch-size 16`，依次测试
+`--batch-size 8`（自动 accumulation=2）和 `--batch-size 16`（自动 accumulation=1）。只有 H100
+峰值显存、非有限值、样本计数和吞吐判据全部通过后，才冻结更大的物理 batch。可用
+`--no-gradient-checkpointing` 做独立对照，但它不是默认值，也不能与 batch 调整同时首测。
+
+## 2026-10-15：24 小时目标的服务器执行入口
+
+服务器 DeepSeek 必须从 [`SMOKE_OPTIMIZATION_HANDOFF.md` §9.7](SMOKE_OPTIMIZATION_HANDOFF.md)
+开始，按 **T4 → T8 →（通过后 T16）→ E1 → E4 → route scan → 可选关闭 checkpointing**
+逐项执行。每次只改一个变量、GPU0 独占、回传原始 events/predictions/routing 与显存快照后再决定
+下一步。不要重跑旧 A–D，不要直接启动 full，不要自行把预计 16–24h 写成实测结论。
+
+特别注意三类变量：
+
+- 增大物理 batch、保持 global batch=16 是吞吐候选；增大 global batch 不是替代方案。
+- eval batch 只有在 batch=1/4 的解析答案和 score 完全一致后才能冻结。
+- route scan=5000 会改变 SMoPE 的频率估计口径，必须通过 1000/5000/10000 保护集合稳定性判据，
+  并在论文中披露 N 与 seed；它不是可以静默采用的工程优化。
+
+普通功能 smoke 若只想确认代码路径，可临时缩短序列：
 
 ```bash
 bash scripts/qwen/run.sh smope smoke --max-length 512 --max-visual-tokens 128
 ```
+
+但这条命令**不得**用于 §9.7 的吞吐对照或正式实验。标定 OOM 时只降低物理
+`--batch-size`，保持 `max-length=1024`、`max-visual-tokens=256`、global batch 与样本不变；否则
+速度结果不具可比性。
 
 ## 输出
 

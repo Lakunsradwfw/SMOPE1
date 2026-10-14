@@ -1,4 +1,5 @@
 import json
+from io import BytesIO
 from pathlib import Path
 import pickle
 import tempfile
@@ -10,16 +11,20 @@ from PIL import Image
 import torch
 from torch.nn import functional as F
 
-from qwen_smope.data import (CoINCollator, CoINDataset, CoINSample, ExactShard,
-                             ImageFetcher, check_model, subsample_records)
-from qwen_smope.diagnose_ddp import validate_variant_world
-from qwen_smope.filtering import (ensure_filter_manifest, impact_level, manifest_for_run,
+from qwen_smope.data import (CoINCollator, CoINDataset, CoINEvalCollator, CoINSample, ExactShard,
+                             ImageFetcher, ImageUnavailableError, check_model,
+                             subsample_records)
+from qwen_smope.diagnose_ddp import validate_global_batch, validate_variant_world
+from qwen_smope.filtering import (build_filter_manifest, build_filter_shard,
+                                  ensure_filter_manifest, filter_signature, impact_level,
+                                  manifest_for_run, merge_filter_shards,
                                   validate_filter_impact)
 from qwen_smope.model import Experts, QwenCoINModel
+from qwen_smope.prepare_data import arguments as prepare_arguments
 from qwen_smope.report import continual_metrics, write_matrix
 from qwen_smope.scoring import box_iou, normalize_answer, normalize_vqa_answer, score_prediction
-from qwen_smope.train import (arguments, eval_dataset, record_dataset, save_checkpoint,
-                              train_dataset)
+from qwen_smope.train import (arguments, eval_dataset, record_dataset, routing_scan_indices,
+                              save_checkpoint, train_dataset)
 
 
 class FakeProcessor:
@@ -59,8 +64,9 @@ class FakeProcessor:
         input_ids = torch.zeros(len(encoded), width, dtype=torch.long)
         attention = torch.zeros_like(input_ids)
         for row, ids in enumerate(encoded):
-            input_ids[row, :len(ids)] = torch.tensor(ids)
-            attention[row, :len(ids)] = 1
+            start = width - len(ids) if self.tokenizer.padding_side == "left" else 0
+            input_ids[row, start:start + len(ids)] = torch.tensor(ids)
+            attention[row, start:start + len(ids)] = 1
         return {"input_ids": input_ids, "attention_mask": attention,
                 "pixel_values": torch.ones(len(encoded), 3, 4, 4),
                 "image_grid_thw": torch.tensor([[1, 2, 2]] * len(encoded))}
@@ -80,6 +86,128 @@ def make_coin(root: Path):
 
 
 class DataTests(unittest.TestCase):
+    def test_eval_collator_left_pads_batches_and_restores_training_padding(self):
+        processor = FakeProcessor()
+        collator = CoINEvalCollator(processor, max_length=32, max_visual_tokens=4,
+                                    fetcher=ImageFetcher("mount"), bucket=1)
+        short = CoINSample("short", "GQA", None,
+                           ({"role": "user", "text": "one"},), "a", ("a",))
+        long = CoINSample("long", "GQA", None,
+                          ({"role": "user", "text": "one two three"},), "a", ("a",))
+        batch = collator([short, long])
+        mask = batch["inputs"]["attention_mask"]
+        self.assertEqual(processor.tokenizer.padding_side, "right")
+        self.assertEqual(mask[0, 0].item(), 0)
+        self.assertEqual(mask[0, -1].item(), 1)
+        self.assertTrue(torch.equal(batch["router_mask"], mask.bool()))
+
+    def test_limited_route_scan_is_seeded_random_and_source_ordered(self):
+        first = routing_scan_indices(100, 12, 42, "GQA", "train")
+        self.assertEqual(first, sorted(first))
+        self.assertEqual(len(first), 12)
+        self.assertNotEqual(first, list(range(12)))
+        self.assertEqual(first, routing_scan_indices(100, 12, 42, "GQA", "train"))
+        self.assertNotEqual(first, routing_scan_indices(100, 12, 43, "GQA", "train"))
+        larger = routing_scan_indices(100, 30, 42, "GQA", "train")
+        self.assertTrue(set(first).issubset(larger))
+        self.assertEqual(routing_scan_indices(5, 0, 42, "GQA", "train"), list(range(5)))
+
+    def test_missing_images_are_audited_but_transient_errors_abort_the_scan(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / "Instructions_Qwen" / "OCRVQA"
+            directory.mkdir(parents=True)
+            rows = [{"id": "missing", "conversations": [
+                {"from": "user", "value": "question"},
+                {"from": "assistant", "value": "answer"}]}]
+            (directory / "train.json").write_text(json.dumps(rows), encoding="utf-8")
+            dataset = CoINDataset(root, "OCRVQA", "train", verify_images=False)
+            signature = {"format_version": 1, "task": "OCRVQA", "split": "train"}
+
+            class MissingCollator:
+                def measure(self, sample):
+                    raise ImageUnavailableError("OCRVQA/missing.jpg", 404)
+
+            manifest = build_filter_manifest(
+                dataset, MissingCollator(), signature, root / "missing.json")
+            row = manifest["excluded_samples"][0]
+            self.assertEqual(row["reason"], "image_unavailable")
+            self.assertEqual(row["http_status"], 404)
+            self.assertIsNone(row["prompt_len"])
+
+            class TransientCollator:
+                def measure(self, sample):
+                    raise TimeoutError("temporary WebDAV timeout")
+
+            with self.assertRaises(TimeoutError):
+                build_filter_manifest(
+                    dataset, TransientCollator(), signature, root / "transient.json")
+            self.assertFalse((root / "transient.json").exists())
+
+    def test_filter_shards_merge_byte_equivalent_to_single_scan(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / "Instructions_Qwen" / "VQAv2"
+            directory.mkdir(parents=True)
+            rows = [{"id": str(index), "conversations": [
+                {"from": "user", "value": "long " * (20 if index == 2 else 1)},
+                {"from": "assistant", "value": "yes"}]}
+                    for index in range(6)]
+            (directory / "train.json").write_text(json.dumps(rows), encoding="utf-8")
+            dataset = CoINDataset(root, "VQAv2", "train", verify_images=False)
+            collator = CoINCollator(
+                FakeProcessor(), max_length=8, max_visual_tokens=4,
+                fetcher=ImageFetcher("mount"), bucket=1)
+            signature = filter_signature(
+                dataset, root, max_length=8, max_visual_tokens=4, length_bucket=1,
+                image_transport="mount", image_base_url=None)
+            single_path, merged_path = root / "single.json", root / "merged.json"
+            build_filter_manifest(dataset, collator, signature, single_path)
+            shards = [
+                build_filter_shard(dataset, collator, signature, 0, 3, root / "part-0.json"),
+                build_filter_shard(dataset, collator, signature, 3, 6, root / "part-1.json"),
+            ]
+            merge_filter_shards(dataset, signature, shards, merged_path)
+            self.assertEqual(single_path.read_bytes(), merged_path.read_bytes())
+
+    def test_http_fetch_retries_transient_status_but_not_permanent_404(self):
+        class Response:
+            def __init__(self, status, body=b""):
+                self.status, self.body = status, body
+
+            def read(self):
+                return self.body
+
+        class Connection:
+            def __init__(self, response):
+                self.response = response
+
+            def request(self, method, url):
+                self.requested = (method, url)
+
+            def getresponse(self):
+                return self.response
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sample = CoINSample("x", "OCRVQA", root / "cl_dataset" / "x.jpg",
+                                ({"role": "user", "text": "q"},), "a", ("a",))
+            fetcher = ImageFetcher("http", "http://example/base/", root,
+                                   timeout_seconds=1, max_attempts=2)
+            with patch.object(fetcher, "_connection",
+                              return_value=Connection(Response(404))) as connection_mock:
+                with self.assertRaises(ImageUnavailableError):
+                    fetcher(sample)
+                self.assertEqual(connection_mock.call_count, 1)
+
+            image = Image.new("RGB", (2, 2), "red")
+            encoded = BytesIO()
+            image.save(encoded, format="PNG")
+            connections = [Connection(Response(503)), Connection(Response(200, encoded.getvalue()))]
+            with patch.object(fetcher, "_connection", side_effect=connections), \
+                    patch("qwen_smope.data.time.sleep"):
+                self.assertEqual(fetcher(sample).size, (2, 2))
+
     def test_full_split_filter_precedes_training_prefix_and_records_lengths(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -648,12 +776,29 @@ class ScoringReportTests(unittest.TestCase):
         self.assertEqual(args.accumulation, 4)
         self.assertEqual(args.effective_global_batch_size, 16)
         self.assertEqual(args.workers, 0)
+        self.assertEqual(args.routing_scan_batch_size, args.batch_size)
+        self.assertTrue(args.gradient_checkpointing)
 
         distributed = arguments(["--method", "smope", "--output", "out"], world_size=2)
         self.assertEqual(distributed.accumulation, 2)
         full = arguments(["--method", "smope", "--mode", "full", "--output", "out"],
                          world_size=1)
         self.assertEqual(full.workers, 4)
+        explicit_scan_batch = arguments([
+            "--method", "smope", "--output", "out", "--routing-scan-batch-size", "1"],
+            world_size=1)
+        self.assertEqual(explicit_scan_batch.routing_scan_batch_size, 1)
+        batched_eval = arguments([
+            "--method", "smope", "--output", "out", "--eval-batch-size", "4"],
+            world_size=1)
+        self.assertEqual(batched_eval.eval_batch_size, 4)
+        no_checkpointing = arguments([
+            "--method", "smope", "--output", "out", "--no-gradient-checkpointing"],
+            world_size=1)
+        self.assertFalse(no_checkpointing.gradient_checkpointing)
+        with self.assertRaises(SystemExit):
+            arguments(["--method", "smope", "--output", "out",
+                       "--routing-scan-batch-size", "0"], world_size=1)
         with self.assertRaises(SystemExit):
             arguments(["--method", "smope", "--output", "out", "--accumulation", "2"],
                       world_size=1)
@@ -667,6 +812,17 @@ class ScoringReportTests(unittest.TestCase):
             validate_variant_world("single", 2)
         with self.assertRaises(ValueError):
             validate_variant_world("ddp-sharded", 1)
+        args = SimpleNamespace(batch_size=4, accumulation=4, global_batch_size=16)
+        self.assertEqual(validate_global_batch(args, 1), 16)
+        args.accumulation = 2
+        with self.assertRaises(ValueError):
+            validate_global_batch(args, 1)
+
+    def test_parallel_filter_cli_caps_http_concurrency(self):
+        args = prepare_arguments(["--scan-workers", "14"])
+        self.assertEqual(args.scan_workers, 14)
+        with self.assertRaises(SystemExit):
+            prepare_arguments(["--scan-workers", "15"])
 
 
 if __name__ == "__main__":

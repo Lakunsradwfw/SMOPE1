@@ -247,6 +247,7 @@ class QwenCoINModel(nn.Module):
 
 def load_model(path: str, device: torch.device | str, method: str = "smope",
                lora_rank: int = 16, lora_alpha: int = 32, lora_dropout: float = 0.05,
+               gradient_checkpointing: bool = True,
                **kwargs: Any) -> QwenCoINModel:
     import transformers
     from transformers import Qwen3_5ForConditionalGeneration
@@ -280,7 +281,11 @@ def load_model(path: str, device: torch.device | str, method: str = "smope",
         torch.cuda.synchronize(device)
     moved = time.perf_counter()
     if method in {"smope", "lora"}:
-        backbone.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        if gradient_checkpointing:
+            backbone.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False})
+        else:
+            backbone.gradient_checkpointing_disable()
         backbone.config.use_cache = False
     from transformers.models.qwen3_5 import modeling_qwen3_5 as implementation
     model.loading_profile = {

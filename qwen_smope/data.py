@@ -6,10 +6,15 @@ resolved at runtime and converted to the official structured image input.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import http.client
+from io import BytesIO
 import json
 from pathlib import Path
+import random
 import re
+import threading
 from typing import Any, Iterable
+import urllib.parse
 
 import torch
 from torch.utils.data import Dataset, Sampler
@@ -21,6 +26,26 @@ TASK_ORDER = (
 )
 IMAGE_PATTERN = re.compile(r"(?:Picture\s+\d+:\s*)?<img>(.*?)</img>", re.IGNORECASE | re.DOTALL)
 ROLE_MAP = {"human": "user", "user": "user", "gpt": "assistant", "assistant": "assistant"}
+
+# CoIN ships the held-out instructions in ``Instructions_Original`` (flat
+# ``question_id``/``image``/``text``/``answer`` records) rather than in the Qwen
+# layer, whose per-task directory only holds ``train.json``. The split that
+# carries gold answers differs per task because the official test files for
+# TextVQA, VizWiz and VQAv2 are unlabelled (and their image directories were
+# never downloaded).
+EVAL_SPLIT_FILES = {
+    "ScienceQA": "test",
+    "TextVQA": "val",
+    "ImageNet": "test",
+    "GQA": "test",
+    "VizWiz": "val",
+    "Grounding": "test",
+    "VQAv2": "val",
+    "OCRVQA": "test",
+}
+# ``Instructions_Original`` writes TextVQA val image paths against
+# ``train_images`` while the files actually live in ``val_images``.
+IMAGE_DIRECTORY_ALIASES = {("TextVQA", "train_images"): "val_images"}
 
 
 def check_model(path: str | Path) -> dict[str, Any]:
@@ -79,38 +104,186 @@ def _normalise_conversations(record: dict[str, Any]) -> list[dict[str, str]]:
 class CoINSample:
     sample_id: str
     task: str
-    image_path: Path
+    image_path: Path | None
     history: tuple[dict[str, str], ...]
     answer: str
     references: tuple[str, ...]
 
-    def prompt_messages(self, image: Any) -> list[dict[str, Any]]:
+    @property
+    def has_image(self) -> bool:
+        return self.image_path is not None
+
+    def prompt_messages(self, image: Any = None) -> list[dict[str, Any]]:
+        """Render turns; the image is attached only when the sample carries one.
+
+        ScienceQA is roughly half text-only questions in the official release, so
+        an unconditional ``{"type": "image"}`` item makes the processor reject
+        those records.
+        """
+        if self.image_path is not None and image is None:
+            raise ValueError(f"Sample {self.sample_id} needs its image but none was supplied")
         messages: list[dict[str, Any]] = []
         image_inserted = False
         for turn in self.history:
             text = IMAGE_PATTERN.sub("", turn["text"]).strip()
-            if turn["role"] == "user" and not image_inserted:
+            if turn["role"] == "user" and self.image_path is not None and not image_inserted:
                 content: Any = [{"type": "image", "image": image}, {"type": "text", "text": text}]
                 image_inserted = True
             else:
                 content = text
             messages.append({"role": turn["role"], "content": content})
-        if not image_inserted:
+        if self.image_path is not None and not image_inserted:
             raise ValueError(f"Sample {self.sample_id} has no user turn for image insertion")
+        if not any(turn["role"] == "user" for turn in self.history):
+            raise ValueError(f"Sample {self.sample_id} has no user turn")
         return messages
 
 
+class ImageFetcher:
+    """Loads sample images from the filesystem or straight over HTTP.
+
+    The davfs mount cannot carry this workload: it serialises metadata inside one
+    client process, re-fetches whole directories every ``dir_refresh`` seconds
+    (``GQA/images`` holds 148854 entries), reads in 16 KiB requests, and reports
+    stale negatives for trees written by an out-of-band HTTP client. Measured on
+    this box: 233 MB in 582 s through the mount versus 2.4 s (97 MB/s) over HTTP.
+    """
+
+    def __init__(self, kind: str = "mount", base_url: str | None = None,
+                 coin_root: str | Path | None = None) -> None:
+        if kind not in ("mount", "http"):
+            raise ValueError(f"Unknown image transport: {kind!r}")
+        if kind == "http" and not base_url:
+            raise ValueError("HTTP image transport needs --image-base-url")
+        self.kind = kind
+        self.coin_root = Path(coin_root).resolve() if coin_root else None
+        self._local = threading.local()
+        if kind == "http":
+            parsed = urllib.parse.urlsplit(base_url)
+            if not parsed.hostname:
+                raise ValueError(f"Bad --image-base-url: {base_url!r}")
+            self.host = parsed.hostname
+            self.port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            self.secure = parsed.scheme == "https"
+            self.prefix = urllib.parse.quote(parsed.path.rstrip("/") + "/", safe="/%()")
+
+    def _connection(self) -> http.client.HTTPConnection:
+        connection = getattr(self._local, "connection", None)
+        if connection is None:
+            factory = http.client.HTTPSConnection if self.secure else http.client.HTTPConnection
+            connection = self._local.connection = factory(self.host, self.port, timeout=120)
+        return connection
+
+    def __getstate__(self) -> dict[str, Any]:
+        """``threading.local`` is not picklable, and DataLoader pickles the collator
+        (which holds this fetcher) into every worker process."""
+        state = self.__dict__.copy()
+        state.pop("_local", None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._local = threading.local()
+
+    def _url(self, path: Path) -> str:
+        if self.coin_root is None:
+            raise ValueError("HTTP image transport needs the CoIN root to build URLs")
+        relative = path.resolve().relative_to(self.coin_root / "cl_dataset")
+        return self.prefix + urllib.parse.quote(str(relative), safe="/")
+
+    def __call__(self, sample: CoINSample) -> Any:
+        from PIL import Image
+
+        if not sample.has_image:
+            return None
+        if self.kind == "mount":
+            return Image.open(sample.image_path).convert("RGB")
+        url = self._url(sample.image_path)
+        for attempt in range(2):
+            try:
+                connection = self._connection()
+                connection.request("GET", url)
+                response = connection.getresponse()
+                body = response.read()
+                if response.status != 200:
+                    raise FileNotFoundError(f"HTTP {response.status} for {url}")
+                return Image.open(BytesIO(body)).convert("RGB")
+            except (http.client.HTTPException, OSError):
+                self._local.connection = None
+                if attempt:
+                    raise
+        raise AssertionError("unreachable")
+
+
+def subsample_records(records: list[Any], limit: int, seed: str) -> list[Any]:
+    """Deterministic fixed-seed sample, returned in source order.
+
+    Continual evaluation scores every task once per completed task, so the
+    held-out set has to be identical across methods, seeds and rounds; the seed
+    is therefore derived from the task and split rather than from ``--seed``.
+    """
+    if limit <= 0 or len(records) <= limit:
+        return records
+    generator = random.Random(seed)
+    return [records[index] for index in sorted(generator.sample(range(len(records)), limit))]
+
+
+def resolve_split_path(root: str | Path, task: str, split: str) -> tuple[Path, str]:
+    """Return the ``(path, format)`` backing a CoIN task split.
+
+    Training lives in the Qwen conversation layer. Held-out instructions are the
+    flat ``Instructions_Original`` records, so evaluation prefers that layer and
+    falls back to ``EVAL_SPLIT_FILES`` for tasks whose official test file carries
+    no gold answers.
+    """
+    root = Path(root).resolve()
+    qwen = root / "Instructions_Qwen" / task / f"{split}.json"
+    original = root / "Instructions_Original" / task / f"{split}.json"
+    candidates: list[tuple[Path, str]] = []
+    if split in ("train", "train_new"):
+        candidates.append((qwen, "qwen"))
+    else:
+        # The declared held-out file wins over the requested name: for TextVQA,
+        # VizWiz and VQAv2 the ``test`` file exists but carries neither gold
+        # answers nor a downloadable image directory.
+        declared = EVAL_SPLIT_FILES.get(task)
+        if declared:
+            candidates.append((root / "Instructions_Original" / task / f"{declared}.json", "original"))
+        if split != declared:
+            candidates.append((original, "original"))
+        candidates.append((qwen, "qwen"))
+    for path, kind in candidates:
+        if path.is_file():
+            return path, kind
+    available = sorted(
+        f"{layer.name}/{task}/{item.name}"
+        for layer in (qwen.parent.parent, original.parent.parent) if layer.is_dir()
+        for item in layer.glob("*.json"))
+    requested = ", ".join(str(path) for path, _ in candidates)
+    raise FileNotFoundError(
+        f"Missing CoIN split for {task}/{split}; tried {requested}; available={available}")
+
+
 class CoINDataset(Dataset):
-    """One CoIN task split from ``Instructions_Qwen/<task>/<split>.json``."""
+    """One CoIN task split.
+
+    Training reads the Qwen conversation layer
+    (``Instructions_Qwen/<task>/<split>.json``). Held-out instructions live in
+    ``Instructions_Original/<task>/<split>.json`` as flat records, so evaluation
+    resolves that layer first and wraps each record into a Qwen conversation at
+    load time; the source files stay untouched.
+    """
 
     def __init__(self, root: str | Path, task: str, split: str,
-                 max_samples: int = 0, require_images: bool = True) -> None:
+                 max_samples: int = 0, require_images: bool = True,
+                 sample_seed: str | None = None, verify_images: bool = True) -> None:
         self.root = Path(root).resolve()
         self.task = task
-        path = self.root / "Instructions_Qwen" / task / f"{split}.json"
-        if not path.is_file():
-            available = sorted(p.name for p in path.parent.glob("*.json")) if path.parent.is_dir() else []
-            raise FileNotFoundError(f"Missing CoIN split {path}; available={available}")
+        # With HTTP image transport the mount must not be touched at all: a stat
+        # would be both slow and untrustworthy. Paths are still derived (so the
+        # fetcher can build URLs) but never probed.
+        self.verify_images = verify_images
+        path, self.format = resolve_split_path(self.root, task, split)
         self.path = path.resolve()
         self.split = split
         self.source_size = self.path.stat().st_size
@@ -119,9 +292,16 @@ class CoINDataset(Dataset):
         if not isinstance(records, list):
             raise ValueError(f"{path} must contain a JSON array")
         if max_samples > 0:
-            records = records[:max_samples]
-        textvqa_references = self._textvqa_references(split) if task == "TextVQA" else {}
-        self.samples = [self._convert(record, index, require_images, textvqa_references)
+            # Held-out splits are sampled, not truncated: taking the first N of a
+            # 214k-record VQAv2 val file would score one contiguous slice of it.
+            records = (subsample_records(records, max_samples, sample_seed)
+                       if sample_seed is not None else records[:max_samples])
+        self.sampled = len(records)
+        convert = self._convert if self.format == "qwen" else self._convert_flat
+        # Key the official TextVQA annotations off the file actually loaded, so a
+        # held-out ``val`` split picks up ``TextVQA_0.5.1_val.json`` directly.
+        textvqa_references = self._textvqa_references(self.path.stem) if task == "TextVQA" else {}
+        self.samples = [convert(record, index, require_images, textvqa_references)
                         for index, record in enumerate(records)]
         if not self.samples:
             raise ValueError(f"Empty CoIN split: {path}")
@@ -150,6 +330,98 @@ class CoINDataset(Dataset):
                 return result
         return {}
 
+    def _image_candidates(self, raw: str, aliases: bool = True) -> list[str]:
+        """Root-relative candidate paths, applying known directory aliases first.
+
+        ``aliases`` must be true only for the ``Instructions_Original`` layer. The
+        TextVQA repair exists because that layer's ``val.json`` points at
+        ``train_images`` for files that live in ``val_images``; the training layer
+        spells ``train_images`` correctly and rewriting it there would send every
+        training image to a 404.
+        """
+        cleaned = str(raw).strip().replace("\\", "/")
+        while cleaned.startswith("./"):
+            cleaned = cleaned[2:]
+        bases = [] if cleaned.startswith("cl_dataset/") else ["cl_dataset/" + cleaned]
+        bases.append(cleaned)
+        candidates: list[str] = []
+        for base in bases:
+            if aliases:
+                segments = base.split("/")
+                for position, segment in enumerate(segments):
+                    replacement = IMAGE_DIRECTORY_ALIASES.get((self.task, segment))
+                    if replacement:
+                        aliased = "/".join(segments[:position] + [replacement]
+                                           + segments[position + 1:])
+                        if aliased not in candidates:
+                            candidates.append(aliased)
+            if base not in candidates:
+                candidates.append(base)
+        return candidates
+
+    def _resolve_image(self, raw: Any, index: int, require_images: bool,
+                       aliases: bool = True) -> Path | None:
+        """Resolve an image reference, or ``None`` for a genuinely text-only sample.
+
+        ScienceQA is about half text-only questions in the official release, so an
+        absent ``image`` is a property of the dataset rather than a download gap.
+        """
+        if raw is None or not str(raw).strip():
+            return None
+        candidates = self._image_candidates(str(raw), aliases)
+        if not self.verify_images:
+            # The aliased candidate comes first, which is also the correct one for
+            # TextVQA's ``train_images`` -> ``val_images`` repair.
+            return _safe_path(self.root, candidates[0])
+        for candidate in candidates:
+            path = _safe_path(self.root, candidate)
+            if path.is_file():
+                return path
+        missing = _safe_path(self.root, candidates[0])
+        if require_images:
+            raise FileNotFoundError(f"Missing image for {self.task}[{index}]: {missing}")
+        return None
+
+    @staticmethod
+    def _flat_references(record: dict[str, Any]) -> tuple[str, ...]:
+        """Gold answer of an ``Instructions_Original`` record.
+
+        ``answer_bbox`` is preferred over ``origin_answer_bbox`` because Grounding
+        boxes are scored in normalised coordinates, matching the training targets.
+        """
+        for key in ("answer", "answers", "answer_bbox"):
+            raw = record.get(key)
+            if raw is None:
+                continue
+            if isinstance(raw, list):
+                values = tuple(str(item.get("answer", "") if isinstance(item, dict) else item)
+                               for item in raw)
+                values = tuple(value for value in values if value.strip())
+            elif str(raw).strip():
+                values = (str(raw).strip(),)
+            else:
+                continue
+            if values:
+                return values
+        raise ValueError("Evaluation sample has no answer, answers, or answer_bbox")
+
+    def _convert_flat(self, record: dict[str, Any], index: int, require_images: bool,
+                      textvqa_references: dict[str, tuple[str, ...]]) -> CoINSample:
+        """Wrap a flat ``Instructions_Original`` record into Qwen conversation form."""
+        text = record.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(f"{self.task}[{index}] has no instruction text")
+        image_path = self._resolve_image(record.get("image"), index, require_images)
+        sample_id = str(record.get("question_id", record.get("id", f"{self.task}-{index}")))
+        references = textvqa_references.get(sample_id) or self._flat_references(record)
+        answer = references[0]
+        if self.task == "ScienceQA" and answer.isdigit() and 0 <= int(answer) < 5:
+            answer = chr(ord("A") + int(answer))
+            references = (answer,)
+        return CoINSample(sample_id=sample_id, task=self.task, image_path=image_path,
+                          history=({"role": "user", "text": text.strip()},),
+                          answer=answer, references=references)
+
     @staticmethod
     def _record_references(record: dict[str, Any], fallback: str | None) -> tuple[str, ...]:
         raw = record.get("answers")
@@ -172,18 +444,11 @@ class CoINDataset(Dataset):
                  textvqa_references: dict[str, tuple[str, ...]]) -> CoINSample:
         turns = _normalise_conversations(record)
         inline = [match.group(1) for turn in turns for match in IMAGE_PATTERN.finditer(turn["text"])]
-        raw_image = inline[0] if inline else record.get("image")
-        if not raw_image:
-            raise ValueError(f"{self.task}[{index}] has no image path")
         if len(set(inline)) > 1:
             raise ValueError(f"{self.task}[{index}] references multiple images; unsupported")
-        image_path = _safe_path(self.root, str(raw_image))
-        if not image_path.is_file() and record.get("image"):
-            fallback = _safe_path(self.root / "cl_dataset", str(record["image"]))
-            if fallback.is_file():
-                image_path = fallback
-        if require_images and not image_path.is_file():
-            raise FileNotFoundError(f"Missing image for {self.task}[{index}]: {image_path}")
+        raw_image = inline[0] if inline else record.get("image")
+        # Qwen 训练层不做目录别名修正: 它的路径本来就是对的
+        image_path = self._resolve_image(raw_image, index, require_images, aliases=False)
         sample_id = str(record.get("question_id", record.get("id", f"{self.task}-{index}")))
         has_assistant_answer = turns[-1]["role"] == "assistant" and bool(turns[-1]["text"].strip())
         conversation_answer = turns[-1]["text"].strip() if has_assistant_answer else None
@@ -221,9 +486,12 @@ class ExactShard(Sampler[int]):
 class CoINCollator:
     """Build answer-only SFT batches and a leak-free prefix routing mask."""
 
-    def __init__(self, processor: Any, max_length: int = 1024, max_visual_tokens: int = 256):
+    def __init__(self, processor: Any, max_length: int = 1024, max_visual_tokens: int = 256,
+                 fetcher: ImageFetcher | None = None, bucket: int = 128):
         self.processor = processor
         self.max_length = max_length
+        self.bucket = bucket
+        self.fetcher = fetcher or ImageFetcher("mount")
         image_processor = processor.image_processor
         merge = image_processor.merge_size
         factor = image_processor.patch_size * merge
@@ -232,27 +500,42 @@ class CoINCollator:
             "longest_edge": max_visual_tokens * factor * factor,
         }
 
-    def _encode(self, texts: list[str], images: list[Any]) -> dict[str, torch.Tensor]:
+    def _encode(self, texts: list[str], images: list[list[Any]] | None) -> dict[str, torch.Tensor]:
+        # ``images`` is one list per sample, empty for text-only records; the
+        # processor rejects an empty flat list, so a fully text-only batch passes
+        # ``None``.
+        #
+        # ``pad_to_multiple_of`` 把宽度收敛到有限的几个桶。Triton 为每个新宽度编译
+        # 一整族内核（实测磁盘缓存 4894 个条目仍不够：同一批数据第二次运行的
+        # preflight 还要 20s，而 torch 回退只要 1.5s），变长输入会让每个 batch 都
+        # 触发新编译，实测 >17s/步；分桶后 preflight 降到 0.3s。
+        # 必须让 processor 自己 padding：它还会返回 mm_token_type_ids 等张量，
+        # 事后手动只补 input_ids/attention_mask 会造成形状不一致
+        # （实测 IndexError: mask [384] vs tensor [326]）。
+        bucket = self.bucket if 1 < self.bucket <= self.max_length else None
         encoded = self.processor(
-            text=texts, images=images, padding=True, truncation=True, max_length=self.max_length,
+            text=texts, images=images, padding=True, pad_to_multiple_of=bucket,
+            truncation=True, max_length=self.max_length,
             return_tensors="pt", images_kwargs={"size": self.image_size},
         )
         encoded.pop("token_type_ids", None)
         return dict(encoded)
 
-    def __call__(self, batch: list[CoINSample]) -> dict[str, Any]:
-        from PIL import Image
+    def _batch_images(self, batch: list[CoINSample]) -> list[list[Any]] | None:
+        images = [[self.fetcher(sample)] if sample.has_image else [] for sample in batch]
+        return images if any(images) else None
 
-        images, prompt_texts, full_texts = [], [], []
-        for sample in batch:
-            image = Image.open(sample.image_path).convert("RGB")
+    def __call__(self, batch: list[CoINSample]) -> dict[str, Any]:
+        images = self._batch_images(batch)
+        prompt_texts, full_texts = [], []
+        for sample, sample_images in zip(batch, images or [[]] * len(batch)):
+            image = sample_images[0] if sample_images else None
             messages = sample.prompt_messages(image)
             prompt_texts.append(self.processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True, enable_thinking=False))
             full_texts.append(self.processor.apply_chat_template(
                 messages + [{"role": "assistant", "content": sample.answer}],
                 tokenize=False, add_generation_prompt=False, enable_thinking=False))
-            images.append(image)
         prompt = self._encode(prompt_texts, images)
         full = self._encode(full_texts, images)
         prompt_lengths = prompt["attention_mask"].sum(-1).long()
@@ -274,15 +557,12 @@ class CoINCollator:
 
 class CoINEvalCollator(CoINCollator):
     def __call__(self, batch: list[CoINSample]) -> dict[str, Any]:
-        from PIL import Image
-
-        images, texts = [], []
-        for sample in batch:
-            image = Image.open(sample.image_path).convert("RGB")
+        images = self._batch_images(batch)
+        texts = []
+        for sample, sample_images in zip(batch, images or [[]] * len(batch)):
             texts.append(self.processor.apply_chat_template(
-                sample.prompt_messages(image), tokenize=False,
+                sample.prompt_messages(sample_images[0] if sample_images else None), tokenize=False,
                 add_generation_prompt=True, enable_thinking=False))
-            images.append(image)
         inputs = self._encode(texts, images)
         return {"inputs": inputs, "router_mask": inputs["attention_mask"].bool(),
                 "metadata": [{"id": s.sample_id, "task": s.task, "answer": s.answer,

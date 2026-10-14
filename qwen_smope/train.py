@@ -24,7 +24,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 
 from .data import (TASK_ORDER, CoINCollator, CoINDataset, CoINEvalCollator,
-                   ExactShard, check_model)
+                   ExactShard, ImageFetcher, check_model, resolve_split_path)
+
+
+DEFAULT_IMAGE_BASE_URL = (
+    "http://10.0.255.254:4918/Storage(default)/ProjectGroup(group_h100)"
+    "/zq/SMOPE/datas/CoIN/cl_dataset/")
 from .model import QwenCoINModel, load_model
 from .report import event, write_json, write_jsonl, write_matrix
 from .scoring import score_prediction
@@ -40,7 +45,15 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--method", choices=("zero_shot", "lora", "smope"), required=True)
     parser.add_argument("--mode", choices=("preflight", "smoke", "full"), default="smoke")
     parser.add_argument("--model-path", default="pretrained/Qwen3.5-9B")
+    parser.add_argument("--processor-path", default=None,
+                        help="processor/tokenizer 所在目录，默认与 --model-path 相同。"
+                             "指向本地副本可避免在 davfs 上读取 tokenizer.json")
     parser.add_argument("--coin-root", default="datas/CoIN")
+    parser.add_argument("--image-transport", choices=("mount", "http"), default="mount",
+                        help="图像读取通道。mount 走 davfs 挂载；http 直连 WebDAV 服务器，"
+                             "实测快约 60 倍（挂载 233MB/582s vs HTTP 2.4s）")
+    parser.add_argument("--image-base-url", default=DEFAULT_IMAGE_BASE_URL,
+                        help="image-transport=http 时的 cl_dataset 根 URL")
     parser.add_argument("--output", required=True)
     parser.add_argument("--tasks", default=",".join(TASK_ORDER))
     parser.add_argument("--train-split", default="train")
@@ -49,17 +62,30 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--dense-epochs", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--eval-batch-size", type=int, default=1)
-    parser.add_argument("--accumulation", type=int, default=8)
-    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--accumulation", type=int, default=2)
+    # 注意: 每个 DataLoader 只要 workers>0, 就要付一次 forkserver 启动 + 各 worker
+    # import torch/transformers 并反序列化 processor 的固定代价, 实测约 24~38s,
+    # **且几乎不随 worker 数变化**。make_loader 在训练、route_scan 及每次 evaluate_task
+    # 都被调用, 所以 smoke 模式下这笔开销会完全淹没真实计算
+    # (实测 train_sparse: workers=8 时 23.46s, workers=0 时 0.45s)。
+    # 但正式 run 总共只创建约 52 个 DataLoader, 合计约半小时, 相对 20~30 小时的
+    # 训练可以忽略, 而 workers>0 能让 HTTP 取图与计算重叠。取图中位数 4:
+    # 4 线程实测 84 文件/s, 已远超需要。做 smoke 排查时可加 --workers 0 看真实耗时。
+    parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--worker-start-method", choices=WORKER_START_METHODS,
                         default=DEFAULT_WORKER_START_METHOD)
     parser.add_argument("--max-length", type=int, default=1024)
+    parser.add_argument("--length-bucket", type=int, default=128,
+                        help="把 batch 宽度向上对齐到该倍数, 收敛 Triton 需要编译的形状数。"
+                             "0 或 1 关闭。实测变长输入下每个新宽度要编译一整族内核, "
+                             "导致 >17s/步（固定形状只要 0.33s/步）")
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--max-visual-tokens", type=int, default=256)
     parser.add_argument("--max-train-samples", type=int, default=0)
     parser.add_argument("--max-eval-samples", type=int, default=0)
+    parser.add_argument("--eval-sample-seed", type=int, default=42)
     parser.add_argument("--routing-scan-samples", type=int, default=0)
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--weight-decay", type=float, default=0.0)
@@ -135,6 +161,27 @@ def make_loader(dataset, collator, args, rank: int, world: int, train: bool = Fa
                       pin_memory=True, multiprocessing_context=context), sampler
 
 
+def image_fetcher(args) -> ImageFetcher:
+    return ImageFetcher(args.image_transport, args.image_base_url, args.coin_root)
+
+
+def train_dataset(args, task: str) -> CoINDataset:
+    return CoINDataset(args.coin_root, task, args.train_split, args.max_train_samples,
+                       verify_images=args.image_transport == "mount")
+
+
+def eval_dataset(args, task: str) -> CoINDataset:
+    """Held-out split, sampled with a seed derived from the task rather than --seed.
+
+    Every method, seed sweep and continual-learning round must score the identical
+    held-out examples, otherwise the accuracy matrix compares different data.
+    """
+    return CoINDataset(
+        args.coin_root, task, args.eval_split, args.max_eval_samples,
+        sample_seed=f"coin-eval-{args.eval_sample_seed}-{task}-{args.eval_split}",
+        verify_images=args.image_transport == "mount")
+
+
 def optimizer_for(model: QwenCoINModel, args) -> torch.optim.Optimizer:
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not parameters:
@@ -156,10 +203,25 @@ def scheduler_for(optimizer, updates: int, warmup_ratio: float):
 
 def save_checkpoint(path: Path, model: QwenCoINModel, next_task: int,
                     matrix: list[list[float]], signature: dict, rank: int) -> None:
+    """Persist the lightweight adapter, task progress and accuracy matrix.
+
+    This is the resume point: it runs once per completed task, so a crashed run
+    loses at most the task in progress. Upstream had this body pasted into
+    ``record_dataset`` (where ``signature``/``next_task``/``matrix``/``model`` are
+    not defined) and left this function as a bare ``sync()``, so no checkpoint was
+    ever written and ``--resume`` could never have worked.
+    """
+    if rank == 0:
+        state = {"format_version": 2, "signature": signature, "next_task": next_task,
+                 "matrix": matrix, "adapter": model.lightweight_state()}
+        temporary = path.with_suffix(".tmp")
+        torch.save(state, temporary)
+        temporary.replace(path)
     sync()
 
 
 def record_dataset(directory: str | Path, dataset: CoINDataset, role: str, rank: int) -> None:
+    """Record which split file backed a role, for later provenance checks."""
     if rank != 0:
         return
     path = Path(directory) / "dataset_manifest.json"
@@ -169,13 +231,6 @@ def record_dataset(directory: str | Path, dataset: CoINDataset, role: str, rank:
         "source_mtime_ns": dataset.source_mtime_ns, "examples_loaded": len(dataset),
     }
     write_json(path, manifest)
-    if rank == 0:
-        state = {"format_version": 2, "signature": signature, "next_task": next_task,
-                 "matrix": matrix, "adapter": model.lightweight_state()}
-        temporary = path.with_suffix(".tmp")
-        torch.save(state, temporary)
-        temporary.replace(path)
-    sync()
 
 
 @contextlib.contextmanager
@@ -315,7 +370,13 @@ def evaluate_task(model: QwenCoINModel, dataset, collator, processor, args, devi
 def model_signature(args, config: dict, world: int) -> dict:
     identity = {key: value for key, value in vars(args).items()
                 if key not in {"output", "resume", "workers", "worker_start_method",
-                               "log_every", "model_path", "coin_root"}}
+                               "log_every", "model_path", "processor_path", "coin_root",
+                               # I/O plumbing: same bytes either way, so switching
+                               # transport must not invalidate a resume.
+                               "image_transport", "image_base_url",
+                               # Padding width only; masked positions contribute
+                               # nothing to the loss, so it is not experiment state.
+                               "length_bucket"}}
     index = Path(args.model_path) / "model.safetensors.index.json"
     files = []
     split_roles = [("eval", args.eval_split)]
@@ -324,12 +385,12 @@ def model_signature(args, config: dict, world: int) -> dict:
     root = Path(args.coin_root).resolve()
     for task in args.tasks:
         for role, split in split_roles:
-            path = root / "Instructions_Qwen" / task / f"{split}.json"
-            if not path.is_file():
-                raise FileNotFoundError(f"Missing CoIN {role} split: {path}")
+            # Resolved, not assumed: training reads Instructions_Qwen while the
+            # held-out instructions come from Instructions_Original.
+            path, kind = resolve_split_path(root, task, split)
             stat = path.stat()
-            files.append({"role": role, "task": task, "split": split,
-                          "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+            files.append({"role": role, "task": task, "split": split, "format": kind,
+                          "source": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
     return {"arguments": identity, "world_size": world, "model_config": config,
             "dataset_files": files,
             "weight_index_sha256": hashlib.sha256(index.read_bytes()).hexdigest() if index.is_file() else None}
@@ -375,18 +436,21 @@ def main(argv: list[str] | None = None) -> None:
             raise ValueError("Resume requires identical method, task order, model and training arguments")
 
     from transformers import AutoProcessor
-    processor = AutoProcessor.from_pretrained(args.model_path, local_files_only=True)
+    processor = AutoProcessor.from_pretrained(args.processor_path or args.model_path,
+                                              local_files_only=True)
     processor.tokenizer.padding_side = "right"
-    train_collator = CoINCollator(processor, args.max_length, args.max_visual_tokens)
-    eval_collator = CoINEvalCollator(processor, args.max_length, args.max_visual_tokens)
+    fetcher = image_fetcher(args)
+    train_collator = CoINCollator(processor, args.max_length, args.max_visual_tokens, fetcher,
+                                  bucket=args.length_bucket)
+    eval_collator = CoINEvalCollator(processor, args.max_length, args.max_visual_tokens, fetcher,
+                                     bucket=args.length_bucket)
     preview_index = 0 if checkpoint is None else min(checkpoint["next_task"], len(args.tasks) - 1)
     preview_task = args.tasks[preview_index]
     preview_role = "eval" if args.method == "zero_shot" else "train"
-    preview_split = args.eval_split if args.method == "zero_shot" else args.train_split
-    preview_limit = args.max_eval_samples if args.method == "zero_shot" else args.max_train_samples
     # Parse one real split and process one image before allocating 9B parameters.
     # Remaining task files were already checked by model_signature and are loaded lazily.
-    preview_set = CoINDataset(args.coin_root, preview_task, preview_split, preview_limit)
+    preview_set = (eval_dataset(args, preview_task) if preview_role == "eval" else
+                   train_dataset(args, preview_task))
     record_dataset(output, preview_set, preview_role, rank)
     (eval_collator if args.method == "zero_shot" else train_collator)([preview_set[0]])
 
@@ -451,8 +515,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.method == "zero_shot":
         scores = {}
         for task_index, task in enumerate(args.tasks):
-            dataset = preview_set if task_index == preview_index else CoINDataset(
-                args.coin_root, task, args.eval_split, args.max_eval_samples)
+            dataset = preview_set if task_index == preview_index else eval_dataset(args, task)
             record_dataset(output, dataset, "eval", rank)
             with stage(args, "zero_shot_evaluation", args.tasks.index(task), device, rank, world):
                 scores[task] = evaluate_task(model, dataset, eval_collator, processor,
@@ -473,8 +536,8 @@ def main(argv: list[str] | None = None) -> None:
     start_task = checkpoint["next_task"] if checkpoint else 0
     for task_index in range(start_task, len(args.tasks)):
         task = args.tasks[task_index]
-        train_set = preview_set if task_index == preview_index else CoINDataset(
-            args.coin_root, task, args.train_split, args.max_train_samples)
+        train_set = (preview_set if task_index == preview_index
+                     else train_dataset(args, task))
         if train_set is preview_set:
             preview_set = None
         record_dataset(output, train_set, "train", rank)
@@ -503,7 +566,7 @@ def main(argv: list[str] | None = None) -> None:
         gc.collect()
         row = []
         for seen_task in args.tasks[:task_index + 1]:
-            eval_set = CoINDataset(args.coin_root, seen_task, args.eval_split, args.max_eval_samples)
+            eval_set = eval_dataset(args, seen_task)
             record_dataset(output, eval_set, "eval", rank)
             with stage(args, f"evaluate_{seen_task}", task_index, device, rank, world):
                 row.append(evaluate_task(model, eval_set, eval_collator, processor, args,

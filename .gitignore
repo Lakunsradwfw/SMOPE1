@@ -142,3 +142,6 @@ Training
 Blog
 About
 Loading complete
+
+# 本地化的 CoIN 指令集副本(3GB, 由 stage_coin_local.sh 生成, 不入库)
+coin_local/

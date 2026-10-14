@@ -121,6 +121,9 @@ HTTP 图片通道和 `--length-bucket=128`。SMoPE 路由统计默认使用
 
 ## 2026-10-15：24 小时目标的服务器执行入口
 
+本轮代码实现提交是 `83ef103`；服务器应拉取 GitHub `v2` 的最新 HEAD（其后还有回填 SHA 的文档
+提交），并用 `git log -2 --oneline` 确认历史中包含 `83ef103` 后再开始。
+
 服务器 DeepSeek 必须从 [`SMOKE_OPTIMIZATION_HANDOFF.md` §9.7](SMOKE_OPTIMIZATION_HANDOFF.md)
 开始，按 **T4 → T8 →（通过后 T16）→ E1 → E4 → route scan → 可选关闭 checkpointing**
 逐项执行。每次只改一个变量、GPU0 独占、回传原始 events/predictions/routing 与显存快照后再决定

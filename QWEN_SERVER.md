@@ -1,5 +1,9 @@
 # Qwen3.5-9B + CoIN 实验说明
 
+smoke 性能、超长样本过滤、DDP 诊断的唯一当前结论与服务器执行顺序见
+[`SMOKE_OPTIMIZATION_HANDOFF.md`](SMOKE_OPTIMIZATION_HANDOFF.md)。本文只说明常规运行接口；
+在独占 H100 的 A/B/C/D 原始产物完成前，不把 DDP 作为默认，也不报告加速倍数。
+
 本入口在 CoIN 八任务上运行三种可比较配置，全部从 post-trained 多模态
 `Qwen/Qwen3.5-9B` 开始，不再支持旧的 Base+CIFAR/CUB/ImageNet-R 分类实验。
 
@@ -14,7 +18,7 @@
 
 ## 环境与数据
 
-推荐 Linux、Python 3.11、两张 A100 40GB：
+目标服务器为 Linux、Python 3.11、2×H100 80GB；当前普通训练默认只使用一张卡：
 
 ```bash
 conda create -n smope-coin python=3.11 -y
@@ -35,6 +39,20 @@ python scripts/qwen/check_coin.py \
   --model-path /absolute/Qwen3.5-9B \
   --coin-root /absolute/CoIN
 ```
+
+训练前还必须用真实 processor 和图片扫描完整训练 split，生成所有方法、seed 共用的确定性
+过滤清单；过滤发生在 `--max-train-samples` 之前：
+
+```bash
+python -m qwen_smope.prepare_data \
+  --model-path /absolute/Qwen3.5-9B \
+  --coin-root /absolute/CoIN \
+  --image-transport http \
+  --filter-cache outputs/coin-qwen3.5-9b/_filter_cache
+```
+
+逐任务剔除率达到 10% 时，full 会拒绝启动；只有审阅 manifest 后才能显式使用
+`--allow-high-filter-rate`。评测 split 不做该过滤。
 
 ## 运行
 
@@ -63,6 +81,10 @@ SEEDS="0 1 2" bash scripts/qwen/run.sh lora full
 SEEDS="0 1 2" bash scripts/qwen/run.sh smope full
 ```
 
+`scripts/qwen/run.sh` 默认 `NPROC_PER_NODE=1`。`NPROC_PER_NODE=2` 仅用于交接文档中的受控 DDP
+诊断，不能直接作为正式默认。诊断入口是 `python -m qwen_smope.diagnose_ddp`，必须严格按
+single → multiprocess-independent → ddp-same-batch → ddp-sharded 的顺序执行。
+
 默认任务顺序为论文随机顺序：
 
 ```text
@@ -72,9 +94,13 @@ ScienceQA, TextVQA, ImageNet, GQA, VizWiz, Grounding, VQAv2, OCRVQA
 可用 `--tasks` 显式修改。正式对比必须让 LoRA 与 SMoPE 使用相同任务顺序、样本、图像预算、
 最大序列长度和生成长度。
 
-主要训练设置：BF16、每卡 batch 1、梯度累积 8、每任务 1 epoch、最多 1024 token、
+主要训练设置：BF16、每卡 batch 4、有效全局 batch 16、每任务 1 epoch、最多 1024 token、
 最多 256 个合并视觉 token。SMoPE 默认 25 专家、Top-5，只注入 8 个 full-attention 层；
 路由由最后 prefix token 与 prefix 均值的可学习混合决定，答案生成期间固定。
+
+未显式指定 `--accumulation` 时，单卡自动取 4、双卡自动取 2；不整除或显式值与
+`--global-batch-size` 冲突会拒绝启动。`--workers` 默认 preflight/smoke=0、full=4；继续使用
+HTTP 图片通道和 `--length-bucket=128`。
 
 OOM 时依次降低：
 
@@ -87,7 +113,8 @@ bash scripts/qwen/run.sh smope smoke --max-length 512 --max-visual-tokens 128
 默认输出为 `outputs/coin-qwen3.5-9b/<method>/<mode>/seed-<seed>/`：
 
 - `environment.json`：参数、版本、GPU、模型配置和权重索引摘要。
-- `dataset_manifest.json`：实际读取的指令文件、大小、修改时间和样本数。
+- `dataset_manifest.json`：实际读取的数据源；训练任务还包含原始数、有效数、实际采样数、
+  逐任务剔除率、确认状态，以及每条剔除样本的 task/id/prompt/answer/full token 长度与原因。
 - `events.jsonl`：训练损失、学习率、耗时与峰值显存。
 - `predictions/<stage>/<task>.jsonl`：原始答案、参考答案、解析结果和样本得分。
 - `accuracy_matrix.csv`：训练到每个阶段后，所有已见任务的 CoIN task accuracy。

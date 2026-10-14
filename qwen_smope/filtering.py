@@ -1,0 +1,169 @@
+"""Deterministic, auditable filtering for over-length CoIN training samples."""
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+from typing import Any, Callable
+
+from .data import CoINCollator, CoINDataset
+from .report import write_json
+
+
+FILTER_FORMAT_VERSION = 1
+PROCESSOR_FILES = (
+    "chat_template.jinja",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "vocab.json",
+    "merges.txt",
+    "preprocessor_config.json",
+    "processor_config.json",
+)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def processor_signature(path: str | Path) -> dict[str, str]:
+    root = Path(path).resolve()
+    return {name: _sha256(root / name) for name in PROCESSOR_FILES if (root / name).is_file()}
+
+
+def filter_signature(dataset: CoINDataset, processor_path: str | Path, *,
+                     max_length: int, max_visual_tokens: int, length_bucket: int,
+                     image_transport: str, image_base_url: str | None) -> dict[str, Any]:
+    return {
+        "format_version": FILTER_FORMAT_VERSION,
+        "task": dataset.task,
+        "split": dataset.split,
+        "source": str(dataset.path),
+        "source_size_bytes": dataset.source_size,
+        "source_mtime_ns": dataset.source_mtime_ns,
+        "processor": processor_signature(processor_path),
+        "max_length": max_length,
+        "max_visual_tokens": max_visual_tokens,
+        "length_bucket": length_bucket,
+        "image_transport": image_transport,
+        "image_base_url": image_base_url if image_transport == "http" else None,
+    }
+
+
+def signature_digest(signature: dict[str, Any]) -> str:
+    encoded = json.dumps(signature, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def filter_cache_path(cache: str | Path, signature: dict[str, Any]) -> Path:
+    digest = signature_digest(signature)[:16]
+    return Path(cache) / f"{signature['task']}-{signature['split']}-{digest}.json"
+
+
+def impact_level(rate: float) -> str:
+    if rate >= 0.10:
+        return "high"
+    if rate >= 0.01:
+        return "material"
+    return "low"
+
+
+def build_filter_manifest(dataset: CoINDataset, collator: CoINCollator,
+                          signature: dict[str, Any], path: str | Path,
+                          progress: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
+    """Inspect the complete source split and atomically persist valid source indices."""
+    valid_indices: list[int] = []
+    excluded: list[dict[str, Any]] = []
+    for index, sample in enumerate(dataset.samples):
+        measurement = collator.measure(sample)
+        if measurement["reason"] is None:
+            valid_indices.append(index)
+        else:
+            excluded.append({"source_index": index, **measurement})
+        processed = index + 1
+        if progress is not None and (processed % 1000 == 0 or processed == len(dataset.samples)):
+            progress({"type": "filter_scan_progress", "task": dataset.task,
+                      "processed": processed, "total": len(dataset.samples),
+                      "excluded_examples": len(excluded)})
+    original = len(dataset.samples)
+    rate = len(excluded) / original if original else 0.0
+    manifest = {
+        "format_version": FILTER_FORMAT_VERSION,
+        "signature": signature,
+        "signature_sha256": signature_digest(signature),
+        "task": dataset.task,
+        "split": dataset.split,
+        "original_examples": original,
+        "valid_examples": len(valid_indices),
+        "excluded_examples": len(excluded),
+        "excluded_rate": rate,
+        "impact": impact_level(rate),
+        "valid_indices": valid_indices,
+        "excluded_samples": excluded,
+    }
+    write_json(path, manifest)
+    return manifest
+
+
+def load_filter_manifest(path: str | Path, signature: dict[str, Any]) -> dict[str, Any]:
+    path = Path(path)
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if manifest.get("format_version") != FILTER_FORMAT_VERSION:
+        raise ValueError(f"Unsupported filter manifest format: {path}")
+    if manifest.get("signature") != signature:
+        raise ValueError(f"Stale or incompatible filter manifest: {path}")
+    valid = manifest.get("valid_indices")
+    excluded = manifest.get("excluded_samples")
+    if not isinstance(valid, list) or not isinstance(excluded, list):
+        raise ValueError(f"Incomplete filter manifest: {path}")
+    if manifest.get("valid_examples") != len(valid) or manifest.get("excluded_examples") != len(excluded):
+        raise ValueError(f"Inconsistent filter manifest counts: {path}")
+    return manifest
+
+
+def ensure_filter_manifest(dataset: CoINDataset, collator: CoINCollator,
+                           cache: str | Path, processor_path: str | Path, *,
+                           max_length: int, max_visual_tokens: int, length_bucket: int,
+                           image_transport: str, image_base_url: str | None,
+                           progress: Callable[[dict[str, Any]], None] | None = None,
+                           ) -> tuple[dict[str, Any], Path, bool]:
+    signature = filter_signature(
+        dataset, processor_path, max_length=max_length,
+        max_visual_tokens=max_visual_tokens, length_bucket=length_bucket,
+        image_transport=image_transport, image_base_url=image_base_url)
+    path = filter_cache_path(cache, signature)
+    if path.is_file():
+        return load_filter_manifest(path, signature), path, False
+    return build_filter_manifest(dataset, collator, signature, path, progress), path, True
+
+
+def validate_filter_impact(manifest: dict[str, Any], *, mode: str,
+                           allow_high_filter_rate: bool) -> None:
+    if mode == "full" and manifest["impact"] == "high" and not allow_high_filter_rate:
+        rate = 100 * float(manifest["excluded_rate"])
+        raise RuntimeError(
+            f"{manifest['task']} filters {rate:.2f}% of training samples; "
+            "review dataset_manifest.json and pass --allow-high-filter-rate to acknowledge it")
+
+
+def manifest_for_run(manifest: dict[str, Any], cache_path: str | Path,
+                     sampled_examples: int, acknowledged: bool) -> dict[str, Any]:
+    """Paper-facing manifest payload; excludes the large valid-index implementation detail."""
+    return {
+        "cache": str(Path(cache_path).resolve()),
+        "signature_sha256": manifest["signature_sha256"],
+        "original_examples": manifest["original_examples"],
+        "valid_examples": manifest["valid_examples"],
+        "sampled_examples": sampled_examples,
+        "excluded_examples": manifest["excluded_examples"],
+        "excluded_rate": manifest["excluded_rate"],
+        "impact": manifest["impact"],
+        "high_filter_rate_acknowledged": bool(acknowledged),
+        "excluded_samples": manifest["excluded_samples"],
+    }

@@ -287,7 +287,11 @@ refcoco/refcoco/          refcoco_plus/refcoco+/     refcocog/refcocog/
 `--eval-sample-seed` 默认 42。采样是**随机子集且保持源文件顺序**，
 不是"取前 N 条"——后者对 214k 条的 VQAv2 val 只会评到其中一段连续切片。
 
-训练 split 仍保持"取前 N 条"的旧语义（`smoke` / `preflight` 依赖它）。
+训练 split 的当前语义是：先用真实 processor、chat template、图片尺寸、视觉 token 上限和
+`max_length` 扫描完整 split，确定性剔除无法保留完整答案的样本，再从有效样本序列取前 N 条。
+过滤缓存不以 N 为键，所以 smoke/full、所有方法和 seed 使用同一有效前缀。详细字段、剔除率门禁
+和服务器验证状态统一见 [`SMOKE_OPTIMIZATION_HANDOFF.md`](SMOKE_OPTIMIZATION_HANDOFF.md)。
+评测采样不应用训练过滤，仍保持上文固定种子的随机子集语义。
 
 > 注：曾评估过改用 `vantuan5644/CoIN-CL` 提供的固定种子子集
 > （`*_subset*_seed42.json`），但那是**第三方**为另一套训练代码制作的产物，其取舍规则
@@ -414,9 +418,9 @@ smoke 模式下这笔开销完全淹没真实计算：
 | `evaluate_ScienceQA` | 46.32 s | **4.46 s** |
 | `route_scan` | 49.31 s | **8.75 s** |
 
-正式 run 总共只创建约 52 个 DataLoader（合计约半小时，相对 20~30 小时的训练可忽略），
-且 `workers>0` 能让 HTTP 取图与计算重叠，所以默认取 `--workers 4`。
-**做 smoke 排查时请加 `--workers 0`**，否则你看到的耗时几乎全是启动开销。
+正式 run 总共只创建约 52 个 DataLoader，且 `workers>0` 能让 HTTP 取图与计算重叠。因此当前
+默认按模式选择：preflight/smoke 为 `--workers 0`，full 为 `--workers 4`。如需覆盖必须把值
+写入实验配置，避免把 worker 启动成本误认成模型步时。
 
 ### 已知的数据瑕疵（不影响可用性，但读数时要知道）
 

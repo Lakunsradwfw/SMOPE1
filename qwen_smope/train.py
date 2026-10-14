@@ -25,6 +25,8 @@ from torch.utils.data import DataLoader, DistributedSampler, Subset
 
 from .data import (TASK_ORDER, CoINCollator, CoINDataset, CoINEvalCollator,
                    ExactShard, ImageFetcher, check_model, resolve_split_path)
+from .filtering import (FILTER_FORMAT_VERSION, ensure_filter_manifest, manifest_for_run,
+                        processor_signature, validate_filter_impact)
 
 
 DEFAULT_IMAGE_BASE_URL = (
@@ -40,7 +42,7 @@ WORKER_START_METHODS = tuple(
 DEFAULT_WORKER_START_METHOD = "forkserver" if "forkserver" in WORKER_START_METHODS else "spawn"
 
 
-def arguments(argv: list[str] | None = None) -> argparse.Namespace:
+def arguments(argv: list[str] | None = None, world_size: int | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--method", choices=("zero_shot", "lora", "smope"), required=True)
     parser.add_argument("--mode", choices=("preflight", "smoke", "full"), default="smoke")
@@ -64,7 +66,9 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dense-epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--eval-batch-size", type=int, default=1)
-    parser.add_argument("--accumulation", type=int, default=2)
+    parser.add_argument("--global-batch-size", type=int, default=16)
+    parser.add_argument("--accumulation", type=int, default=None,
+                        help="默认按 global-batch-size/(batch-size*world-size) 推导")
     # 注意: 每个 DataLoader 只要 workers>0, 就要付一次 forkserver 启动 + 各 worker
     # import torch/transformers 并反序列化 processor 的固定代价, 实测约 24~38s,
     # **且几乎不随 worker 数变化**。make_loader 在训练、route_scan 及每次 evaluate_task
@@ -73,7 +77,8 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     # 但正式 run 总共只创建约 52 个 DataLoader, 合计约半小时, 相对 20~30 小时的
     # 训练可以忽略, 而 workers>0 能让 HTTP 取图与计算重叠。取图中位数 4:
     # 4 线程实测 84 文件/s, 已远超需要。做 smoke 排查时可加 --workers 0 看真实耗时。
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=None,
+                        help="默认 preflight/smoke=0，full=4")
     parser.add_argument("--worker-start-method", choices=WORKER_START_METHODS,
                         default=DEFAULT_WORKER_START_METHOD)
     parser.add_argument("--max-length", type=int, default=1024)
@@ -87,6 +92,10 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-eval-samples", type=int, default=0)
     parser.add_argument("--eval-sample-seed", type=int, default=42)
     parser.add_argument("--routing-scan-samples", type=int, default=0)
+    parser.add_argument("--filter-cache", default="outputs/coin-qwen3.5-9b/_filter_cache",
+                        help="完整训练 split 的确定性长度过滤清单目录")
+    parser.add_argument("--allow-high-filter-rate", action="store_true",
+                        help="确认并允许 full 模式运行剔除率达到 10%% 的任务")
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--clip-grad", type=float, default=1.0)
@@ -110,17 +119,29 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     unknown = set(args.tasks) - set(TASK_ORDER)
     if unknown:
         parser.error(f"Unknown CoIN tasks: {sorted(unknown)}")
-    positive = ("epochs", "batch_size", "eval_batch_size", "accumulation", "max_length",
+    positive = ("epochs", "batch_size", "eval_batch_size", "global_batch_size", "max_length",
                 "max_new_tokens", "max_visual_tokens", "lora_rank", "lora_alpha",
                 "experts", "topk", "log_every")
     if any(getattr(args, name) <= 0 for name in positive):
         parser.error(f"These arguments must be positive: {positive}")
+    if args.workers is None:
+        args.workers = 4 if args.mode == "full" else 0
     if args.topk > args.experts or args.workers < 0 or args.dense_epochs < 0:
         parser.error("Invalid topk/experts/workers/dense-epochs")
     if args.eval_batch_size != 1:
         parser.error("Qwen decoder evaluation currently requires --eval-batch-size 1")
     if args.learning_rate is None:
         args.learning_rate = 2e-4 if args.method == "lora" else 1e-3
+    world = world_size if world_size is not None else int(os.getenv("WORLD_SIZE", "1"))
+    denominator = args.batch_size * world
+    if args.global_batch_size % denominator:
+        parser.error("--global-batch-size must be divisible by --batch-size * WORLD_SIZE")
+    inferred_accumulation = args.global_batch_size // denominator
+    if args.accumulation is None:
+        args.accumulation = inferred_accumulation
+    elif args.accumulation != inferred_accumulation:
+        parser.error("--accumulation conflicts with --global-batch-size and WORLD_SIZE")
+    args.effective_global_batch_size = args.batch_size * world * args.accumulation
     if args.mode == "smoke":
         args.epochs = args.dense_epochs = 1
         args.max_train_samples = args.max_train_samples or 8
@@ -166,8 +187,45 @@ def image_fetcher(args) -> ImageFetcher:
 
 
 def train_dataset(args, task: str) -> CoINDataset:
+    """Legacy loader used by lightweight tests; production calls prepare_train_dataset."""
     return CoINDataset(args.coin_root, task, args.train_split, args.max_train_samples,
                        verify_images=args.image_transport == "mount")
+
+
+def prepare_train_dataset(args, task: str, collator: CoINCollator,
+                          rank: int, world: int) -> CoINDataset:
+    """Filter the complete source split, then take the requested valid prefix."""
+    dataset = CoINDataset(args.coin_root, task, args.train_split, 0,
+                          verify_images=args.image_transport == "mount")
+    processor_path = args.processor_path or args.model_path
+    if rank == 0:
+        manifest, cache_path, built = ensure_filter_manifest(
+            dataset, collator, args.filter_cache, processor_path,
+            max_length=args.max_length, max_visual_tokens=args.max_visual_tokens,
+            length_bucket=args.length_bucket, image_transport=args.image_transport,
+            image_base_url=args.image_base_url,
+            progress=lambda row: event(args.output, row))
+    else:
+        manifest = cache_path = built = None
+    sync()
+    if rank != 0:
+        manifest, cache_path, built = ensure_filter_manifest(
+            dataset, collator, args.filter_cache, processor_path,
+            max_length=args.max_length, max_visual_tokens=args.max_visual_tokens,
+            length_bucket=args.length_bucket, image_transport=args.image_transport,
+            image_base_url=args.image_base_url)
+    validate_filter_impact(
+        manifest, mode=args.mode, allow_high_filter_rate=args.allow_high_filter_rate)
+    dataset.apply_training_filter(manifest["valid_indices"], args.max_train_samples, manifest)
+    dataset.filter_manifest = manifest_for_run(
+        manifest, cache_path, len(dataset), args.allow_high_filter_rate)
+    if rank == 0:
+        event(args.output, {"type": "training_filter", "task": task,
+                            "cache": str(cache_path), "cache_built": built,
+                            **{key: manifest[key] for key in (
+                                "original_examples", "valid_examples", "excluded_examples",
+                                "excluded_rate", "impact")}})
+    return dataset
 
 
 def eval_dataset(args, task: str) -> CoINDataset:
@@ -226,10 +284,13 @@ def record_dataset(directory: str | Path, dataset: CoINDataset, role: str, rank:
         return
     path = Path(directory) / "dataset_manifest.json"
     manifest = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-    manifest[f"{role}:{dataset.task}:{dataset.split}"] = {
+    entry = {
         "source": str(dataset.path), "source_size_bytes": dataset.source_size,
         "source_mtime_ns": dataset.source_mtime_ns, "examples_loaded": len(dataset),
     }
+    if dataset.filter_manifest is not None:
+        entry["training_filter"] = dataset.filter_manifest
+    manifest[f"{role}:{dataset.task}:{dataset.split}"] = entry
     write_json(path, manifest)
 
 
@@ -371,6 +432,7 @@ def model_signature(args, config: dict, world: int) -> dict:
     identity = {key: value for key, value in vars(args).items()
                 if key not in {"output", "resume", "workers", "worker_start_method",
                                "log_every", "model_path", "processor_path", "coin_root",
+                               "filter_cache", "allow_high_filter_rate",
                                # I/O plumbing: same bytes either way, so switching
                                # transport must not invalidate a resume.
                                "image_transport", "image_base_url",
@@ -392,16 +454,18 @@ def model_signature(args, config: dict, world: int) -> dict:
             files.append({"role": role, "task": task, "split": split, "format": kind,
                           "source": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
     return {"arguments": identity, "world_size": world, "model_config": config,
+            "filter_format_version": FILTER_FORMAT_VERSION,
+            "processor": processor_signature(args.processor_path or args.model_path),
             "dataset_files": files,
             "weight_index_sha256": hashlib.sha256(index.read_bytes()).hexdigest() if index.is_file() else None}
 
 
 def main(argv: list[str] | None = None) -> None:
     run_started = time.perf_counter()
-    args = arguments(argv)
     rank = int(os.getenv("RANK", 0))
     world = int(os.getenv("WORLD_SIZE", 1))
     local_rank = int(os.getenv("LOCAL_RANK", 0))
+    args = arguments(argv, world)
     if not torch.cuda.is_available():
         raise RuntimeError("CoIN Qwen3.5 runs require CUDA; unit tests remain CPU-only")
     torch.cuda.set_device(local_rank)
@@ -450,7 +514,7 @@ def main(argv: list[str] | None = None) -> None:
     # Parse one real split and process one image before allocating 9B parameters.
     # Remaining task files were already checked by model_signature and are loaded lazily.
     preview_set = (eval_dataset(args, preview_task) if preview_role == "eval" else
-                   train_dataset(args, preview_task))
+                   prepare_train_dataset(args, preview_task, train_collator, rank, world))
     record_dataset(output, preview_set, preview_role, rank)
     (eval_collator if args.method == "zero_shot" else train_collator)([preview_set[0]])
 
@@ -537,7 +601,7 @@ def main(argv: list[str] | None = None) -> None:
     for task_index in range(start_task, len(args.tasks)):
         task = args.tasks[task_index]
         train_set = (preview_set if task_index == preview_index
-                     else train_dataset(args, task))
+                     else prepare_train_dataset(args, task, train_collator, rank, world))
         if train_set is preview_set:
             preview_set = None
         record_dataset(output, train_set, "train", rank)

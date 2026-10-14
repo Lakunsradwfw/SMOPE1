@@ -189,7 +189,9 @@ class ImageFetcher:
         if self.coin_root is None:
             raise ValueError("HTTP image transport needs the CoIN root to build URLs")
         relative = path.resolve().relative_to(self.coin_root / "cl_dataset")
-        return self.prefix + urllib.parse.quote(str(relative), safe="/")
+        # HTTP paths always use POSIX separators.  ``str(Path)`` leaks Windows
+        # backslashes into the URL and percent-encodes them as ``%5C``.
+        return self.prefix + urllib.parse.quote(relative.as_posix(), safe="/")
 
     def __call__(self, sample: CoINSample) -> Any:
         from PIL import Image
@@ -303,8 +305,35 @@ class CoINDataset(Dataset):
         textvqa_references = self._textvqa_references(self.path.stem) if task == "TextVQA" else {}
         self.samples = [convert(record, index, require_images, textvqa_references)
                         for index, record in enumerate(records)]
+        self.original_examples = len(self.samples)
+        self.valid_examples = len(self.samples)
+        self.filter_manifest: dict[str, Any] | None = None
         if not self.samples:
             raise ValueError(f"Empty CoIN split: {path}")
+
+    def apply_training_filter(self, valid_indices: list[int], max_samples: int,
+                              manifest: dict[str, Any]) -> None:
+        """Apply a full-split validity list before taking the training prefix.
+
+        ``valid_indices`` always addresses the complete source split.  Keeping
+        filtering separate from ``max_samples`` makes smoke/full and all methods
+        draw prefixes from the same deterministic valid sequence.
+        """
+        if self.split not in ("train", "train_new"):
+            raise ValueError("Length filtering is training-only")
+        if any(index < 0 or index >= len(self.samples) for index in valid_indices):
+            raise ValueError("Filter manifest contains an out-of-range source index")
+        if valid_indices != sorted(set(valid_indices)):
+            raise ValueError("Filter manifest indices must be unique and source ordered")
+        selected = [self.samples[index] for index in valid_indices]
+        self.valid_examples = len(selected)
+        if max_samples > 0:
+            selected = selected[:max_samples]
+        self.samples = selected
+        self.sampled = len(selected)
+        self.filter_manifest = manifest
+        if not self.samples:
+            raise ValueError(f"Length filter removed every sample from {self.task}/{self.split}")
 
     def _textvqa_references(self, split: str) -> dict[str, tuple[str, ...]]:
         directory = self.root / "cl_dataset" / "TextVQA"
@@ -500,7 +529,8 @@ class CoINCollator:
             "longest_edge": max_visual_tokens * factor * factor,
         }
 
-    def _encode(self, texts: list[str], images: list[list[Any]] | None) -> dict[str, torch.Tensor]:
+    def _encode(self, texts: list[str], images: list[list[Any]] | None, *,
+                truncate: bool = True, bucketed: bool = True) -> dict[str, torch.Tensor]:
         # ``images`` is one list per sample, empty for text-only records; the
         # processor rejects an empty flat list, so a fully text-only batch passes
         # ``None``.
@@ -512,14 +542,43 @@ class CoINCollator:
         # 必须让 processor 自己 padding：它还会返回 mm_token_type_ids 等张量，
         # 事后手动只补 input_ids/attention_mask 会造成形状不一致
         # （实测 IndexError: mask [384] vs tensor [326]）。
-        bucket = self.bucket if 1 < self.bucket <= self.max_length else None
-        encoded = self.processor(
-            text=texts, images=images, padding=True, pad_to_multiple_of=bucket,
-            truncation=True, max_length=self.max_length,
-            return_tensors="pt", images_kwargs={"size": self.image_size},
-        )
+        bucket = self.bucket if bucketed and 1 < self.bucket <= self.max_length else None
+        options = dict(text=texts, images=images, padding=True,
+                       pad_to_multiple_of=bucket, truncation=truncate,
+                       return_tensors="pt", images_kwargs={"size": self.image_size})
+        if truncate:
+            options["max_length"] = self.max_length
+        encoded = self.processor(**options)
         encoded.pop("token_type_ids", None)
         return dict(encoded)
+
+    def measure(self, sample: CoINSample) -> dict[str, Any]:
+        """Measure an untruncated training example with the real multimodal path."""
+        images = self._batch_images([sample])
+        sample_images = images[0] if images else []
+        messages = sample.prompt_messages(sample_images[0] if sample_images else None)
+        prompt_text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        full_text = self.processor.apply_chat_template(
+            messages + [{"role": "assistant", "content": sample.answer}],
+            tokenize=False, add_generation_prompt=False, enable_thinking=False)
+        prompt = self._encode([prompt_text], images, truncate=False, bucketed=False)
+        full = self._encode([full_text], images, truncate=False, bucketed=False)
+        prompt_len = int(prompt["attention_mask"][0].sum())
+        full_len = int(full["attention_mask"][0].sum())
+        prefix_matches = (prompt_len <= full_len and torch.equal(
+            full["input_ids"][0, :prompt_len], prompt["input_ids"][0, :prompt_len]))
+        answer_len = max(full_len - prompt_len, 0) if prefix_matches else 0
+        reason = None
+        if not prefix_matches:
+            reason = "prompt_not_prefix"
+        elif answer_len <= 0:
+            reason = "empty_answer_tokens"
+        elif full_len > self.max_length:
+            reason = "full_length_exceeds_max_length"
+        return {"task": sample.task, "sample_id": sample.sample_id,
+                "prompt_len": prompt_len, "answer_len": answer_len,
+                "full_len": full_len, "reason": reason}
 
     def _batch_images(self, batch: list[CoINSample]) -> list[list[Any]] | None:
         images = [[self.fetcher(sample)] if sample.has_image else [] for sample in batch]

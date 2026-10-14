@@ -18,7 +18,12 @@ if ! command -v torchrun >/dev/null 2>&1; then
   echo "  source $PWD/.venv2/bin/activate" >&2
   exit 2
 fi
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+case "$NPROC_PER_NODE" in
+  1) export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" ;;
+  2) export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}" ;;
+  *) echo "NPROC_PER_NODE 只支持 1（默认单卡）或 2（受控 DDP）" >&2; exit 2 ;;
+esac
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export PYTHONUNBUFFERED=1
@@ -35,6 +40,7 @@ COIN_ROOT="${COIN_ROOT:-/mnt/zq/SMOPE/coin_local}"
 MODEL_PATH="${MODEL_PATH:-/dev/shm/qwen35-9b}"
 PROCESSOR_PATH="${PROCESSOR_PATH:-}"
 IMAGE_TRANSPORT="${IMAGE_TRANSPORT:-http}"
+FILTER_CACHE="${FILTER_CACHE:-outputs/coin-qwen3.5-9b/_filter_cache}"
 
 if [[ ! -d "$COIN_ROOT" ]]; then
   echo "COIN_ROOT 不存在: $COIN_ROOT" >&2
@@ -54,9 +60,10 @@ PROCESSOR_ARGS=()
 
 for SEED in ${SEEDS:-0}; do
   OUT="${OUTPUT_ROOT:-outputs/coin-qwen3.5-9b}/${METHOD}/${MODE}/seed-${SEED}"
-  torchrun --standalone --nproc_per_node="${NPROC_PER_NODE:-2}" -m qwen_smope.train \
+  # 单卡是当前保守默认值；双卡 DDP 仍处于受控诊断阶段。
+  torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m qwen_smope.train \
     --method "$METHOD" --mode "$MODE" --seed "$SEED" \
     --model-path "$MODEL_PATH" --coin-root "$COIN_ROOT" \
-    --image-transport "$IMAGE_TRANSPORT" \
+    --image-transport "$IMAGE_TRANSPORT" --filter-cache "$FILTER_CACHE" \
     "${PROCESSOR_ARGS[@]}" --output "$OUT" "$@"
 done

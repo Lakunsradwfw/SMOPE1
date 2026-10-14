@@ -203,9 +203,14 @@ curl -L -C - -o ibot_vit_base16.pth "https://lf3-nlp-opensource.bytetos.com/obj/
 curl -L -C - -o dino_vitbase16_pretrain.pth "https://dl.fbaipublicfiles.com/dino/dino_vitbase16_pretrain/dino_vitbase16_pretrain.pth"
 
 # CoIN generative runs use the post-trained multimodal model, never the Base checkpoint.
+# Smoke 性能、超长训练样本过滤与 DDP 状态统一见 SMOKE_OPTIMIZATION_HANDOFF.md；
+# 当前默认单卡，DDP 尚未在独占 H100 的受控实验中验证为更快。
 MODEL_PATH=pretrained/Qwen3.5-9B COIN_ROOT=/absolute/path/to/CoIN \
   bash scripts/qwen/run_all.sh smoke
 
 # Full zero-shot, sequential LoRA, and SMoPE comparison:
 MODEL_PATH=pretrained/Qwen3.5-9B COIN_ROOT=/absolute/path/to/CoIN \
   bash scripts/qwen/run_all.sh full
+
+CoIN smoke 性能、超长训练样本过滤与 DDP 当前状态统一见
+[`SMOKE_OPTIMIZATION_HANDOFF.md`](SMOKE_OPTIMIZATION_HANDOFF.md)。

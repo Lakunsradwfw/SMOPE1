@@ -12,6 +12,9 @@ from torch.nn import functional as F
 
 from qwen_smope.data import (CoINCollator, CoINDataset, CoINSample, ExactShard,
                              ImageFetcher, check_model, subsample_records)
+from qwen_smope.diagnose_ddp import validate_variant_world
+from qwen_smope.filtering import (ensure_filter_manifest, impact_level, manifest_for_run,
+                                  validate_filter_impact)
 from qwen_smope.model import Experts, QwenCoINModel
 from qwen_smope.report import continual_metrics, write_matrix
 from qwen_smope.scoring import box_iou, normalize_answer, normalize_vqa_answer, score_prediction
@@ -37,7 +40,8 @@ class FakeProcessor:
             values.append("assistant")
         return " ".join(values)
 
-    def __call__(self, text, images, padding, truncation, max_length, return_tensors, **kwargs):
+    def __call__(self, text, images, padding, truncation, return_tensors,
+                 max_length=None, **kwargs):
         encoded = []
         for value in text:
             ids = []
@@ -45,7 +49,7 @@ class FakeProcessor:
                 if token not in self.vocabulary:
                     self.vocabulary[token] = len(self.vocabulary) + 3
                 ids.append(self.vocabulary[token])
-            encoded.append(ids[:max_length])
+            encoded.append(ids[:max_length] if truncation and max_length is not None else ids)
         width = max(map(len, encoded))
         # 真实 processor 支持 pad_to_multiple_of；这里如实模拟，否则关于分桶宽度
         # 的断言毫无意义
@@ -76,6 +80,89 @@ def make_coin(root: Path):
 
 
 class DataTests(unittest.TestCase):
+    def test_full_split_filter_precedes_training_prefix_and_records_lengths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+            directory = root / "Instructions_Qwen" / "VQAv2"
+            directory.mkdir(parents=True)
+            rows = []
+            for sample_id, question in [
+                    ("524377", "too " * 20), ("good-1", "short"),
+                    ("good-2", "shorter"), ("good-3", "last")]:
+                rows.append({"id": sample_id, "conversations": [
+                    {"from": "user", "value": question},
+                    {"from": "assistant", "value": "yes"}]})
+            (directory / "train.json").write_text(json.dumps(rows), encoding="utf-8")
+            processor = FakeProcessor()
+            collator = CoINCollator(processor, max_length=8, max_visual_tokens=4,
+                                    fetcher=ImageFetcher("mount"), bucket=1)
+            dataset = CoINDataset(root, "VQAv2", "train", verify_images=False)
+            manifest, cache_path, built = ensure_filter_manifest(
+                dataset, collator, root / "cache", root,
+                max_length=8, max_visual_tokens=4, length_bucket=1,
+                image_transport="mount", image_base_url=None)
+            self.assertTrue(built)
+            self.assertEqual(manifest["excluded_samples"][0]["sample_id"], "524377")
+            self.assertGreater(manifest["excluded_samples"][0]["prompt_len"], 8)
+            self.assertGreater(manifest["excluded_samples"][0]["answer_len"], 0)
+
+            # Filtering is applied to all four records before taking two valid samples.
+            dataset.apply_training_filter(manifest["valid_indices"], 2, manifest)
+            self.assertEqual([sample.sample_id for sample in dataset.samples], ["good-1", "good-2"])
+            dataset.filter_manifest = manifest_for_run(manifest, cache_path, len(dataset), False)
+            output = root / "output"
+            record_dataset(output, dataset, "train", rank=0)
+            recorded = json.loads((output / "dataset_manifest.json").read_text(encoding="utf-8"))
+            details = recorded["train:VQAv2:train"]["training_filter"]
+            self.assertEqual(details["sampled_examples"], 2)
+            self.assertEqual(details["excluded_samples"][0]["answer_len"], 1)
+
+            fresh = CoINDataset(root, "VQAv2", "train", verify_images=False)
+            again, again_path, rebuilt = ensure_filter_manifest(
+                fresh, collator, root / "cache", root,
+                max_length=8, max_visual_tokens=4, length_bucket=1,
+                image_transport="mount", image_base_url=None)
+            self.assertFalse(rebuilt)
+            self.assertEqual(again_path, cache_path)
+            self.assertEqual(again["signature_sha256"], manifest["signature_sha256"])
+
+            # Source metadata is part of the cache key.  Changing the complete
+            # split must create a new cache instead of reusing stale indices.
+            rows.append({"id": "good-4", "conversations": [
+                {"from": "user", "value": "new short"},
+                {"from": "assistant", "value": "yes"}]})
+            (directory / "train.json").write_text(json.dumps(rows), encoding="utf-8")
+            changed = CoINDataset(root, "VQAv2", "train", verify_images=False)
+            changed_manifest, changed_path, changed_built = ensure_filter_manifest(
+                changed, collator, root / "cache", root,
+                max_length=8, max_visual_tokens=4, length_bucket=1,
+                image_transport="mount", image_base_url=None)
+            self.assertTrue(changed_built)
+            self.assertNotEqual(changed_path, cache_path)
+            self.assertEqual(changed_manifest["original_examples"], 5)
+
+            (root / "tokenizer_config.json").write_text(
+                '{"revision":"changed"}', encoding="utf-8")
+            processor_manifest, processor_path, processor_built = ensure_filter_manifest(
+                changed, collator, root / "cache", root,
+                max_length=8, max_visual_tokens=4, length_bucket=1,
+                image_transport="mount", image_base_url=None)
+            self.assertTrue(processor_built)
+            self.assertNotEqual(processor_path, changed_path)
+            self.assertNotEqual(processor_manifest["signature_sha256"],
+                                changed_manifest["signature_sha256"])
+
+    def test_filter_impact_levels_and_full_run_gate(self):
+        self.assertEqual(impact_level(0.009), "low")
+        self.assertEqual(impact_level(0.01), "material")
+        self.assertEqual(impact_level(0.10), "high")
+        high = {"task": "VQAv2", "impact": "high", "excluded_rate": 0.10}
+        with self.assertRaises(RuntimeError):
+            validate_filter_impact(high, mode="full", allow_high_filter_rate=False)
+        validate_filter_impact(high, mode="full", allow_high_filter_rate=True)
+        validate_filter_impact(high, mode="smoke", allow_high_filter_rate=False)
+
     def test_dataset_resolves_legacy_image_and_collator_masks_answer(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -555,9 +642,31 @@ class ScoringReportTests(unittest.TestCase):
             self.assertTrue((Path(temporary) / "accuracy_matrix.csv").is_file())
 
     def test_cli_defaults_to_post_trained_model(self):
-        args = arguments(["--method", "smope", "--output", "out"])
+        args = arguments(["--method", "smope", "--output", "out"], world_size=1)
         self.assertEqual(args.model_path, "pretrained/Qwen3.5-9B")
         self.assertNotIn("Base", args.model_path)
+        self.assertEqual(args.accumulation, 4)
+        self.assertEqual(args.effective_global_batch_size, 16)
+        self.assertEqual(args.workers, 0)
+
+        distributed = arguments(["--method", "smope", "--output", "out"], world_size=2)
+        self.assertEqual(distributed.accumulation, 2)
+        full = arguments(["--method", "smope", "--mode", "full", "--output", "out"],
+                         world_size=1)
+        self.assertEqual(full.workers, 4)
+        with self.assertRaises(SystemExit):
+            arguments(["--method", "smope", "--output", "out", "--accumulation", "2"],
+                      world_size=1)
+
+    def test_diagnostic_variant_world_contract(self):
+        validate_variant_world("single", 1)
+        validate_variant_world("multiprocess-independent", 2)
+        validate_variant_world("ddp-same-batch", 2)
+        validate_variant_world("ddp-sharded", 2)
+        with self.assertRaises(ValueError):
+            validate_variant_world("single", 2)
+        with self.assertRaises(ValueError):
+            validate_variant_world("ddp-sharded", 1)
 
 
 if __name__ == "__main__":

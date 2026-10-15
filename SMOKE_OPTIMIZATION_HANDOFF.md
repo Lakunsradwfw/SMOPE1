@@ -671,14 +671,202 @@ seed 分别运行 `--routing-scan-samples 1000`、`5000`、`10000`；`--routing-
 
 | 阶段 | 当前状态 | 通过后冻结 | 未通过行为 |
 |---|---|---|---|
-| T4/T8 | 待验证 | 最快且 <72GiB 的物理 batch | 保持 batch=4 |
-| T16 | 等 T8 通过 | batch=16 或退回 8 | 退回 8，不改 global batch |
-| E1/E4 | 待验证 | eval batch=4；可再试 8 | 退回 1 |
-| route batch 1/4 | 待验证 | routing-scan batch 跟随已冻结物理 batch | 退回 1 |
-| route 1000/5000/10000 | 待验证 | 稳定的最小 N 与 seed=42 | 提高 N 或全量 |
-| no-checkpointing | 等前述参数冻结 | 仅在显存和 15% 判据通过时关闭 | 保持开启 |
+| T4/T8 | **已完成（2026-10-15，§10.1）**：T8/T4=0.979，未达 0.8 判据 | 最快且 <72GiB 的物理 batch | **按预设规则保持 batch=4** |
+| T16 | **不运行**（T8 未通过，前置条件不满足） | batch=16 或退回 8 | 退回 8，不改 global batch |
+| E1/E4 | **已完成（2026-10-15，§10.2）**：时序 0.532× 达标，但 70 个 score/311 条原始输出不一致 | eval batch=4；可再试 8 | **语义判据不通过 → 退回 eval batch=1；E8 不运行** |
+| route batch 1/4 | **已完成（2026-10-15，§10.3）**：速度 0.443× 通过，但整数频次 1,614/3,200 不一致 | routing-scan batch 跟随已冻结物理 batch | **等价性不通过 → 退回 1** |
+| route 1000/5000/10000 | **已完成（2026-10-15，§10.3）**：5000-vs-10000 99.625% 合格（§9.7.4 口径）；5000-vs-全量 99.438% 不合格（§9.6 口径），10000-vs-全量 99.750% | 稳定的最小 N 与 seed=42 | 提高 N 或全量 |
+| no-checkpointing | **已完成（2026-10-15，§10.4）**：0.722×（≥15% 判据通过），峰值 51.0 GiB < 72 GiB | 仅在显存和 15% 判据通过时关闭 | 保持开启 |
 | 单 seed 正式实验 | **禁止启动** | 所有必需项冻结且维护者确认 | 继续标定 |
 
 最终候选（不是授权开跑）为：global batch 16、物理 batch 8/16、eval batch 4、固定评测
 N=1000、route scan N=5000/seed=42、两张卡各跑一个独立单卡方法。所有结果必须先写回本节状态表
 并附原始产物路径；只有维护者确认 ETA <=24h 且语义判据通过，才启动 GPU0 LoRA / GPU1 SMoPE。
+
+## 10. 服务器标定记录（2026-10-15，`8123181`）
+
+> 按 §9.7 执行单逐步实施。所有标定固定 GPU0，GPU1 全程空闲；命令与环境与 §9.7 逐字一致，
+> 每条命令的输出目录唯一。本节目的是回填 §9.7.6 状态，不替代维护者确认。
+
+### 10.1 阶段 T：训练物理 batch T4/T8
+
+前置：工作区干净、HEAD=`8123181`=origin/v2；两卡 0MiB；模型 staging 完整；8 份过滤缓存
+在位（GQA 命中原缓存，`cache_built: false`，剔除 2,605/72,140=3.61% material 与 §8.3.2 一致）。
+T4/T8 均 `--tasks GQA --max-train-samples 1600 --global-batch-size 16 --workers 0`，
+唯一变量为物理 batch（accumulation 自动 4→2），每阶段各 1,600 样本、100 次 optimizer update。
+
+| 指标 | T4（batch 4） | T8（batch 8） | 判据 | 结果 |
+|---|---:|---:|---|---|
+| train_dense | 440.53s | 424.27s | — | — |
+| train_sparse | 345.73s | 345.42s | — | — |
+| dense+sparse | **786.26s** | **769.70s** | T8 ≤ 0.8×T4 | **0.979×，未通过** |
+| 峰值 allocated | 30.11 GiB | 42.60 GiB | <72 GiB | 通过 |
+| 样本数 | 1600+1600 | 1600+1600 | 无遗漏 | 通过 |
+| 非有限值/OOM | 无 | 无 | 无 | 通过 |
+| loss（dense/sparse） | 0.1486 / 0.1654 | 0.1484 / 0.1647 | 语义一致 | 通过（非逐 bit 相同，符合 §9.6 预期） |
+
+**决策（按 §9.7.2 预设规则）**：T8 未达 0.8 判据 → **冻结物理 batch=4**；T16 前置条件
+不满足，未运行。原始产物：`verify-20261015/{train-b4,train-b8}/`（含 `events.jsonl`、
+`environment.json`、`dataset_manifest.json`、`routing/`、`predictions/`、`latest_adapter.pt`）、
+运行日志 `verify-20261015/train-b{4,8}-run.log`、前后 `nvidia-smi` 快照、
+`verify-20261015/train-comparison.json`、`git-head.txt`。
+
+**机制观察（供维护者，不改变上述预设结论）**：T4 与 T8 的**每样本**训练耗时几乎不变
+（T4 dense 0.275 s/样本 vs T8 dense 0.265 s/样本；sparse 0.216 vs 0.216）。即在该配置下
+（workers=0、HTTP 直连、gradient checkpointing 开启），单步耗时随物理 batch 近线性增长，
+扩大物理 batch 不产生吞吐收益；成本对本实验更接近“按样本线性”，而不是按 microbatch 计。
+这与 §9.6 的预期（扩大物理 batch 是首要提速手段）不符，但本轮严格只改物理 batch 一个变量，
+没有在同一对照中混入 workers/评测变量；不追加“换配置再跑一次凑判据”的尝试。
+
+### 10.2 阶段 E：批量生成 E1/E4（§9.7.3）
+
+命令与 §9.7.3 逐字一致（zero_shot full，8 任务 ×100 样本，`--eval-sample-seed 42`，
+`--workers 4`），唯一变量 `--eval-batch-size` 1→4。GPU0、独占，两卡运行前后 0MiB。
+
+**时序**（逐任务 `zero_shot_evaluation` stage，秒）：
+
+| 任务 | E1（batch 1） | E4（batch 4） | 速度比 |
+|---|---:|---:|---:|
+| ScienceQA | 31.19 | 28.00 | 0.90 |
+| TextVQA | 45.38 | 25.13 | 0.55 |
+| ImageNet | 24.84 | 16.78 | 0.68 |
+| GQA | 23.72 | 16.81 | 0.71 |
+| VizWiz | 28.92 | 18.79 | 0.65 |
+| Grounding | 174.52 | 59.25 | 0.34 |
+| VQAv2 | 24.18 | 17.04 | 0.70 |
+| OCRVQA | 31.65 | 22.53 | 0.71 |
+| **合计** | **384.40** | **204.34** | **0.532** |
+
+wall：E1 406.79s，E4 226.72s（0.557×）。**时序判据 T_E4 ≤ 0.7×T_E1 通过**；
+两套日志均无 padding warning、异常或 OOM（`eval-b{1,4}-run.log` 零告警）。
+
+**语义判据不通过**（逐样本对照 `eval-b1-b4-comparison.json`，脚本 `compare_eval.py`）：
+样本 ID 集合逐任务一致，但 8/8 任务出现差异——score 不一致合计 70/800（OCRVQA 29、
+VizWiz 12、ImageNet 10、TextVQA 9、VQAv2 4、ScienceQA 3、GQA 3、Grounding 0），
+解析答案不一致合计 215/800（Grounding 91、OCRVQA 45、VizWiz 25、ImageNet 19、
+TextVQA 14、VQAv2 10、GQA 6、ScienceQA 5），原始输出不同 311/800。总体平均准确率
+55.0%→59.7%（OCRVQA 46→71、ImageNet 29→37、VizWiz 60→64 为大头）。原始 diff 全量
+存档于 `eval-b1-b4-comparison.json`。
+
+**机制（供维护者）**：生成是贪心解码（`do_sample=False, num_beams=1`），评测 collator 的
+左填充与 attention_mask 传递已核对无误（`CoINEvalCollator`），processor 逐图编码、无批内
+耦合。差异形态符合“bf16 内核在不同 batch 形状下的归约次序差异 → 近持平 argmax 翻转 →
+贪心解码级联”这一数值机制：Grounding 99/100 原始输出在坐标末位抖动（IoU 判分不变、
+score 0 个差异），长答案任务则首个 token 翻转即整句改变（如 OCRVQA
+`'Unanswerable'`→`'Science & Math'`、`'No'`→`'no'`）。该差异不是 padding 正确性缺陷，
+但在当前内核/精度下**无法保证 batch>1 与 batch=1 语义等价**。
+
+**决策（按 §9.7.3 预设规则）**：语义判据不通过 → **正式设置退回 `--eval-batch-size 1`；
+E8 不运行**。原始产物：`verify-20261015/{eval-b1,eval-b4}/zero_shot/full/seed-0/`
+（events、predictions、summary）、`eval-b{1,4}-run.log`、前后 nvidia-smi、
+`eval-b1-times.json`、`eval-b1-b4-comparison.json`。
+
+**附：实测评测吞吐（供冻结 `--max-eval-samples`）**——batch 1 各任务 samples/s：
+ScienceQA 3.21、TextVQA 2.20、ImageNet 4.03、GQA 4.22、VizWiz 3.46、Grounding 0.57、
+VQAv2 4.14、OCRVQA 3.16；8 任务合计 384.4s/800 条 ≈ **2.08 条/s**（workers=4，含
+worker 启动）。冻结 N 与 ETA 由维护者按 §9.5 决定；本记录只提供实测吞吐，不给结论。
+
+### 10.3 阶段 R：route scan（batch 1/4 已完成；N 稳定性进行中）
+
+**方法修正（留给维护者的偏差记录）**：标准入口把 route scan 的数据集绑定为**训练集对象**
+（`scan_routes(model, train_set, ...)`，`source_count = len(train_set)`）。smoke 下
+`--max-train-samples` 会把扫描源截断（实测 `--max-train-samples 1` 时
+`sample_count=1, source_count=1`，即第一次尝试只扫了 1 条，产物保留在 `route-b1/`），
+而 full 下扫全任务集前后要付完整任务训练。为在不支付任务训练的前提下复现生产语义
+（§3.1 的“从完整过滤后任务集做固定随机排列的前 N 条”），本轮用驱动脚本
+`verify-20261015/route_scan_calib.py`：复用仓库的 `scan_routes`/`prepare_train_dataset`/
+`load_model`，扫描源为完整过滤集（断言 12,726），每次扫描前用 `lightweight_state`/
+`load_lightweight_state` 恢复同一模型状态。**偏差**：模型状态为刚加载（未训练任务）的
+SMoPE 状态，而非任务训练后状态；b1/b4 等价性与 N 稳定性是批处理/采样机制问题，
+未训练的近似均匀路由器是近持平（最保守）的对照情形。
+
+**batch 1/4 对照**（同 seed=42、同 400 条，来自 12,726 的固定随机子集）：
+
+| 配置 | 耗时 | 判据 | 结果 |
+|---|---:|---|---|
+| batch 1, N=400 | 58.49s（6.84 条/s） | — | 基线 |
+| batch 4, N=400 | 25.92s（15.43 条/s） | T_b4 ≤ 0.8×T_b1 | **0.443×，通过** |
+| batch 4, N=400 重复 | 16.70s（23.96 条/s，首次含形状预热） | 可复现 | 与首次 **逐字节一致** |
+
+**等价性判据不通过**：batch 4 与 batch 1 的 routing JSON **非逐字节一致**。
+逐项：`task_frequency` 3,200 个整数单元中 1,614 个不同（总选择数两边均 256,000=400×8×16×5）；
+最大单元差 136（单头总量 2,000）；两套扫描的 `protected` 字段相同（0/8 层差异，但该字段是
+扫描前的既有状态，恢复快照后必然一致，不构成证据）；按 §9.7.4 规则（cumulative frequency
+>= positive-frequency mean，与 `expert.next_task()` 逐式一致）从两套 JSON 推导的 protected
+集合一致率 97.750%（3,128/3,200；true 单元 773 vs 763）。
+
+**机制（供维护者）**：未训练路由器的 logits 接近均匀，近持平 argmax 多；bf16 下 batch 形状
+改变内核归约次序 → 选择翻转 → 整数频次改变（与 §10.2 E 阶段同一类数值机制）。b4 重复运行
+逐字节可复现，说明差异不是随机性而是确定性的批形状数值差。
+
+**决策（按 §9.7.6 预设规则）**：整数频次非完全一致 → **route scan batch 退回 1**；
+N 稳定性序列（1000/5000/10000/full，seed 42）随即在 **batch 1** 下运行
+（产物 `route-calib/routing/ScienceQA-b1-N*.json`）。
+成本含义（batch 1 实测稳态 ~10.4–11.1 条/s，N≤任务集时为线性）：
+全量扫描 570,260 条约 15.3 小时/方法/seed；N=10000×8 任务约 2.1 小时；N=5000 约 1.1 小时。
+
+**N 稳定性（§9.7.4/§9.6 判据；从 cumulative frequency 按 next_task 规则逐式推导，脚本
+`analyze_route_stability.py`，原始数值 `route-calib-b1-stability.txt`）**：
+
+| 扫描 | 耗时 | 推得 protected=true 单元 |
+|---|---:|---:|
+| N=1000 | 93.0s | 790 |
+| N=5000 | 489.8s | 816 |
+| N=10000 | 963.5s | 824 |
+| N=12726（全量） | 1147.2s | 830 |
+
+一致率矩阵：
+
+| | N=1000 | N=5000 | N=10000 | 全量 |
+|---|---:|---:|---:|---:|
+| N=1000 | — | 99.125% | 98.875% | 98.688% |
+| N=5000 | | — | **99.625%** | 99.438% |
+| N=10000 | | | — | 99.750% |
+
+**留给维护者的两个口径（本节不做采用决定）**：§9.7.4 的字面判据“5000 与 10000 一致率
+≥99.5%”**满足**（99.625%）；§9.6 的参考口径“5000 与参考（full/尽可能大）≥99.5%”
+**不满足**（5000 vs 全量 99.438%），而 10000 vs 全量 99.750% 满足。即：若以全量为参考，
+证据支持 10000 或保留全量；若采用 §9.7.4 口径则 5000 合规。请维护者按意向口径裁定并
+写明论文披露的 N 与 seed。**重要 caveat**：本轮扫描状态为未训练路由器（近似均匀频率
+分布，均值规则最敏感），且为单次扫描的 cumulative frequency；正式训练中 protected 由
+跨任务累计频率在任务边界冻结，分布的集中度不同，N 稳定性的绝对值可能变化。
+
+### 10.4 阶段 C：关闭 gradient checkpointing（§9.7.5）
+
+命令 = 已冻结的 T4 命令 + `--no-gradient-checkpointing`（唯一变量），输出 `train-nogc/`。
+
+| 指标 | T4（GC 开启） | noGC | 判据 | 结果 |
+|---|---:|---:|---|---|
+| train_dense | 440.53s | 314.29s | — | — |
+| train_sparse | 345.73s | 253.24s | — | — |
+| dense+sparse | 786.26s | **567.53s** | ≤0.85×T4 | **0.722×，通过（快 27.8%）** |
+| 峰值 allocated | 30.11 GiB | 51.00 GiB | <72 GiB | 通过（reserved 53.36 GiB） |
+| 样本数 / 非有限值 / OOM | 1600+1600 | 1600+1600，无 | 无 | 通过 |
+| loss（dense/sparse） | 0.1486/0.1654 | 0.1486/0.1654 | 语义一致 | 通过（与 T4 同批逐位一致，checkpointing 数值等价） |
+
+**决策（按 §9.7.5 预设规则）**：三项判据全部通过 → **正式训练采用
+`--no-gradient-checkpointing`**，显存代价 +20.9 GiB（51.0 vs 30.1，仍低于 72 GiB 门禁）。
+原始产物：`verify-20261015/train-nogc/`、`train-nogc-run.log`、前后 nvidia-smi。
+
+**未测交叉项（仅提示，不自行加测）**：T8（物理 batch 8）在 noGC 下未测。本轮 T8 的结论
+是“每样本耗时近恒定”的串行成本主导，noGC 省下的是每样本的计算时间，不改变批扩展行为；
+预计 T8+noGC 约为 ~0.97×T4+noGC，仍不满足 T 判据，但这只是推断，未实测。
+
+### 10.5 本轮标定汇总与 ETA 输入（供维护者按 §9.5 重算；以下为实测吞吐的算术，不是结论）
+
+实测吞吐（GPU0 独占、HTTP 图像通道、GQA/ScienceQA 样本）：
+
+| 阶段 | 冻结设置 | 实测 | 备注 |
+|---|---|---|---|
+| 训练 dense | batch 4, noGC, workers=0 | 0.196 s/样本（314.29s/1600） | 仅 SMoPE 首任务需要 |
+| 训练 sparse | batch 4, noGC, workers=0 | 0.158 s/样本（253.24s/1600） | 每任务 1 epoch |
+| route scan | batch 1, workers=0 | 稳态 ~10.4–11.1 条/s（N≥1000） | N=400 首次 7.0/s（含预热） |
+| 评测 batch 1 | workers=4 | 8 任务合计 2.08 条/s；Grounding 0.57、其余 2.2–4.2 | 100 条/任务实测 |
+
+按冻结设置（noGC、scan batch 1、eval batch 1）的算术示例——**单方法单 seed**：
+训练 sparse 570,260×0.158≈25.0h；SMoPE dense 12,726×0.196≈0.7h（LoRA 无）；
+route scan N=5000×8 任务≈1.1h（N=10000≈2.1h）；评测（N=1000/任务、36 个矩阵单元按逐任务
+实测速率）≈4.8h；即 SMoPE ≈31.5h、LoRA ≈29.8h、zero-shot ≈1.1h。**这些是 workers=0
+标定口径下的算术**；full 模式 workers=4 的流水线重叠未参与标定，实际可能偏移，维护者
+应按正式设置复核后再冻结 ETA。若 N=5000 按 §9.7.4 口径采用，单 seed 双卡并行（LoRA/SMoPE）
+的墙钟估计仍在 30h 量级，超出 §9.6 的 16–24h 目标，主要瓶颈是训练吞吐而非评测或扫描。

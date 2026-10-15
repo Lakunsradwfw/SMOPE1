@@ -1084,3 +1084,59 @@ bucket 或升级依赖碰运气。
 - 论文主方法仍按 §10.7 用 full route；DDP 只改变执行并行度，不解决 N=10000 与 full 的算法
   口径差异。若 full route 一天目标不成立，应诚实报告更长时间，或把 sampled 版作为明确命名的
   效率变体，不能偷偷替换主方法。
+
+## 11. 服务器执行记录（2026-10-15，`b37bb09`）：E/F 门禁与 P1-DDP
+
+> 服务器按 `git pull origin v2` 后执行（快进 `e907170→b37bb09`，无冲突；36/36 单测、
+> compileall 通过；拉开前两卡 0MiB）。命令与 §9.4/§10.8 逐字一致，产物在
+> `outputs/coin-qwen3.5-9b/verify-20261015b/`（GPU0 与 GPU0+1 前后 nvidia-smi、日志、
+> git HEAD 快照齐全）。
+
+### 11.1 P0 严格 E/F（§10.8.3）
+
+| 运行 | 变体 | 每 rank 样本 | optimizer updates | 有效 global batch | 墙钟 | 非有限可训练参数 |
+|---|---|---:|---:|---:|---:|---:|
+| E | single（batch4×acc4×1） | 1600 | 100 | 16 | **388.39s** | 0 |
+| F | ddp-sharded（batch4×acc2×2） | 800（rank0/rank1） | 100 | 16 | **207.72s**（最慢 rank） | 0 |
+
+E 各 rank 宽度 `[384,512,640,768,896,1024]`；F 两 rank 分别 `[384…1024]` 与 `[384…896]`
+（分片顺序差异，量级小）。两 rank 样本 ID 并集=1600 且与 E 完全一致、无重复。
+
+`python -m qwen_smope.compare_ddp`（输出 `ddp/ef-comparison.json`）：
+
+```text
+protocol_comparable = true          issues = []
+useful_sample_throughput_speedup = 1.870  (single 4.120 条/s -> dual 7.703 条/s)
+passes_speedup_gate = true          (min 1.5)
+```
+
+**P0 通过** → 按 §10.8.4 进入 P1-DDP 生产对照（完成，见 §11.2）。
+
+### 11.2 P1-DDP 生产对照（GQA 8000，§10.8.4）
+
+命令与 §10.8.4/`QWEN_SERVER.md` 逐字一致：唯一变量 world size（accumulation 由 CLI 推导
+4→2），`--no-gradient-checkpointing --workers 4`，两卡独占。先单卡，完成后按原参数切双卡。
+
+| 指标 | 单卡（gbs16） | 双卡 DDP（gbs16） | 判据 | 结果 |
+|---|---:|---:|---|---|
+| train_dense | 1095.85s | 620.23s | — | 1.767× |
+| train_sparse | 1054.68s | **572.66s** | ≥1.5× | **1.842×，通过** |
+| 整体墙钟 | 2224.77s | 1266.42s | — | 1.757× |
+| epoch 样本数 | 8000+8000 | 8000+8000 | =8000 | 通过 |
+| optimizer updates | 500+500 | 500+500 | =500 | 通过 |
+| 有效 global batch | 16 | 16 | 16 | 通过 |
+| loss（dense/sparse） | 0.1288 / 0.1424 | 0.1289 / 0.1427 | 有限、语义一致 | 通过（物理 batch 排布不同，非逐位相同） |
+| input_wait（dense/sparse） | 12.22s / 0.72s | 0.44s / 0.44s | — | 双卡输入等待被 workers=4 完全隐藏 |
+| 宽度分布 | 384–1024（1024 上限触及） | 384–1024，两 rank 同集合 | — | 未观察到量级性错位 |
+| 峰值 allocated | 51.00 GiB | 51.00 GiB | <72 GiB | 通过（每 rank 物理 batch 相同） |
+| checkpoint 可加载 | — | `--resume` 42.2s：加载→签名校验→`next_task=1`→收尾 | 通过 | 通过 |
+
+**P1 通过**。按 §10.8.5：**单个 SMoPE seed 的正式运行采用双卡 DDP，命令中显式
+`NPROC_PER_NODE=2`**（`run.sh` 默认值保持 1，避免历史脚本无意改变硬件预算）。原始产物：
+`verify-20261015b/prod-{single,ddp}-gbs16/`（events、predictions、latest_adapter.pt、
+summary）、`prod-{single,ddp}-run.log`、`prod-ddp-resume-check.log`、前后 nvidia-smi。
+
+**遗留（交由维护者）**：§10.8.5 的“八任务各 2000 条获胜配置”ETA 复算未启动——它属于正式
+实验排程决定，需维护者确认任务/样本预算后再执行；本轮只完成 E/F 与 GQA 8000 两级门禁。
+route 主方法口径（§10.7：full vs sampled）与 LoRA 侧是否也启用 DDP 同样待维护者裁定
+（本轮门禁只覆盖 SMoPE 的 DDP 恢复）。

@@ -947,8 +947,8 @@ DataLoader 的墙钟，后者揭示 padding/桶宽构成。下一轮只跑以下
    自动为2）。此前 T8 是 GC+workers=0 口径，不能代表 noGC+流水线重叠后的扩展性。要求峰值
    <72GiB、样本/有限值正常且比 P1 再快至少15%。
 3. **P3（必须）**：用 P1/P2 获胜设置跑 LoRA GQA 8000，得到 LoRA 自己的 s/样本与显存；
-   禁止继续用 SMoPE 代理。随后只对获胜设置做八任务各 2000 条的代表性 smoke，按任务吞吐
-   重算最终 ETA。
+   禁止继续用 SMoPE 代理。随后按 §12.2 的八任务各8000条标定逐任务重算最终 ETA；早期2000条
+   建议因固定启动成本在线性外推中被过度放大而废止。
 
 若 P2 后仍达不到 0.106s/样本，再做代码级 A/B，而不是启动 full：当前 SMoPE
 `expert_attention` 把普通 Q/K 显式转成 FP32 后矩阵乘；Transformers 官方 eager 路径是原生
@@ -1077,7 +1077,7 @@ bucket 或升级依赖碰运气。
 #### 10.8.5 正式调度决策
 
 - 若 P0 与 P1-DDP 均通过：单个 SMoPE seed 改用双卡 DDP，目标区间先按 N=10000
-  **约20–23h**；实际 ETA 用八任务各2000条获胜配置复算。`run.sh` 暂不静默修改默认值，正式
+  **约20–23h**；实际 ETA 按 §12.2 的八任务各8000条获胜配置复算。`run.sh` 暂不静默修改默认值，正式
   命令必须显式 `NPROC_PER_NODE=2`，避免历史脚本无意改变硬件预算。
 - 若加速 <1.5×：双卡仍可能缩短单 run，但为整个论文矩阵，两张卡各跑 LoRA/SMoPE 或不同 seed
   通常有更高作业吞吐。不要为了“用了 DDP”牺牲总 makespan。
@@ -1140,3 +1140,192 @@ summary）、`prod-{single,ddp}-run.log`、`prod-ddp-resume-check.log`、前后 
 实验排程决定，需维护者确认任务/样本预算后再执行；本轮只完成 E/F 与 GQA 8000 两级门禁。
 route 主方法口径（§10.7：full vs sampled）与 LoRA 侧是否也启用 DDP 同样待维护者裁定
 （本轮门禁只覆盖 SMoPE 的 DDP 恢复）。
+
+## 12. 维护者冻结的下一步：全量实验提速与开跑门禁（2026-10-15）
+
+本节取代 §11.2 末尾“交由维护者”的未决状态，是服务器 agent 当前唯一执行单。严格按顺序执行，
+一次只运行一条命令并先回传上一项产物；在 §12.1 和 §12.2 完成前不得启动三 seed full。
+
+### 12.1 已经不需要再验证的事项
+
+- 不重跑 P0 E/F 或 P1-DDP：§11 已证明相同 global batch、相同样本和相同 update 下，SMoPE
+  sparse 双卡加速 1.842×，checkpoint/resume 正常。
+- 不再单独验证“卡是否装得下”：P1 已实际覆盖宽度 1024，每 rank 峰值 allocated 51.00 GiB，
+  距 72 GiB 门禁仍有约21 GiB；route/eval 没有 backward，显存不会高于训练主路径。
+- 不实现同序预热、static graph、DDP bucket 调参或依赖升级：P1 未出现量级性宽度错位。
+- 不增大 global batch。正式训练保持16；增大它会改变 optimizer update 数和优化轨迹，不是无语义
+  代价的提速。
+
+`full` 模式虽会默认选择 `workers=4`，正式命令仍必须显式写出以便审计。双卡不会自动启用，必须
+设置 `NPROC_PER_NODE=2`；`--no-gradient-checkpointing` 也不是默认值，必须显式设置。双卡时每
+rank 4 个 DataLoader worker，共8个 HTTP 客户端，低于已测得的 WebDAV 并发上限14；运行期间
+禁止另开过滤扫描或其他大量 HTTP 取图作业。
+
+### 12.2 P2：八任务各 8000 条的正式路径 ETA 标定（下一条命令）
+
+目的仅是测量八任务异质性、DDP route 和持续评测的真实墙钟，**不是论文准确率结果**。训练清单
+仍由完整 split 先过滤后再取固定前缀；`max_train_samples=8000` 只用于标定，不能替代 full。
+
+这里明确推翻 §10.8.5/§11.2 中早期的“每任务2000条”建议：每次 DataLoader/FLA 宽度有固定启动
+成本，若用2000条 stage 总时间线性外推 OCRVQA，会把一次固定成本错误放大约83倍。8000条把该
+偏差压到约3–5%，且复用 P1 的样本尺度；多付约数小时的一次性标定，低于错误启动24小时 full
+的代价。
+
+先确认两卡空闲、`/dev/shm/qwen35-9b` 完整、8份 `_filter_cache` 未改变，然后执行：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+NPROC_PER_NODE=2 \
+SEEDS=0 \
+OUTPUT_ROOT=outputs/coin-qwen3.5-9b/verify-20261015c/eta-8x8000 \
+bash scripts/qwen/run.sh smope full \
+  --tasks ScienceQA,TextVQA,ImageNet,GQA,VizWiz,Grounding,VQAv2,OCRVQA \
+  --max-train-samples 8000 \
+  --batch-size 4 --global-batch-size 16 \
+  --no-gradient-checkpointing --workers 4 \
+  --routing-scan-samples 8000 --routing-scan-batch-size 1 \
+  --eval-batch-size 1 --max-eval-samples 200 --eval-sample-seed 42
+```
+
+预期是约2–4小时，但预期时间不是通过条件。必须从
+`eta-8x8000/smope/full/seed-0/events.jsonl` 和 manifest 逐任务填写下表：
+
+| task | valid full N | sparse s/8000 | sparse s/sample | route s/8000 | route sample/s | max input-wait/train | max width | peak GiB |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| ScienceQA | 12,726 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 |
+| TextVQA | 34,602 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 |
+| ImageNet | 129,833 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 |
+| GQA | 69,535 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 |
+| VizWiz | 20,523 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 |
+| Grounding | 55,213 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 |
+| VQAv2 | 82,534 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 |
+| OCRVQA | 165,294 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 | 待填 |
+
+ETA 必须按任务加权，禁止再用 GQA 或八任务简单平均冒充 full：
+
+```text
+T_sparse = Σ_task (sparse_seconds_task / 8000) × valid_full_N_task
+T_dense  = (ScienceQA_dense_seconds / 8000) × 12,726
+T_route  = Σ_task (route_seconds_task / 8000) × valid_full_N_task
+T_eval_upper = 5 × Σ_36_cells evaluate_seconds_at_N200
+T_fixed  = calibration_wall - Σ(dense/sparse/route/evaluate stage seconds)
+T_full_upper = T_sparse + T_dense + T_route + T_eval_upper + T_fixed
+```
+
+`T_eval_upper` 把 N=200 的整个 stage（包括 worker 启动）直接乘5，故是偏保守上界；不要反过来
+删掉启动成本来制造低 ETA。route 的加权全局吞吐同时报告为 `570260 / T_route_seconds`。
+
+P2 必须同时满足以下硬判据：
+
+1. 8个任务全部完成；每个 sparse epoch 为8000条、500次 update、global batch=16；ScienceQA
+   dense 同样为8000条/500次 update；所有 loss/gradient 均有限，checkpoint 可加载。
+2. 每 rank 峰值 allocated `<72 GiB`，全部观测宽度 `<=1024`；任何 OOM 都判失败，不准临时缩短
+   max length 或视觉预算。
+3. 每任务 `input_wait_seconds / train_sparse.seconds <=10%`。超过10%先排查 HTTP/worker/并发，
+   不把数据等待误报为 GPU 算力瓶颈。
+4. 加权 route 全局吞吐 `>=18 sample/s`。这是让 full route 控制在约8.8小时内、给24小时总预算
+   留余量的预注册门槛；route batch 始终为1，不得改回已证伪的 batch=4。
+5. `T_full_upper <=23h`：直接授权正式 seed-0（至少保留1小时运行波动）；
+   `23h < T_full_upper <=24h`：标为边界，只补一次
+   `max_eval_samples=1000` 的双卡 zero-shot 评测以替换保守 `T_eval_upper` 后重算；`>24h`：不得
+   宣称一天内完成，也不得静默把论文主方法改成 N=10000。
+
+若某一任务是明显离群点，先核对其宽度分布与 input wait。只有 input wait 正常而 GPU 计算仍慢，
+才进入 `expert_attention` BF16 matmul 的固定样本数值/吞吐 A/B；P2 前禁止动该数值路径。
+
+### 12.3 P3：LoRA 自身的双卡门禁（P2 回传并判定后执行）
+
+SMoPE 的1.842×不能代替 LoRA 实测。使用同一 GQA 8000、global batch16，先单卡、后双卡：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 NPROC_PER_NODE=1 \
+OUTPUT_ROOT=outputs/coin-qwen3.5-9b/verify-20261015c/lora-single-gbs16 \
+bash scripts/qwen/run.sh lora smoke \
+  --tasks GQA --max-train-samples 8000 \
+  --batch-size 4 --global-batch-size 16 \
+  --no-gradient-checkpointing --workers 4 \
+  --eval-batch-size 1 --max-eval-samples 4
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 NPROC_PER_NODE=2 \
+OUTPUT_ROOT=outputs/coin-qwen3.5-9b/verify-20261015c/lora-ddp-gbs16 \
+bash scripts/qwen/run.sh lora smoke \
+  --tasks GQA --max-train-samples 8000 \
+  --batch-size 4 --global-batch-size 16 \
+  --no-gradient-checkpointing --workers 4 \
+  --eval-batch-size 1 --max-eval-samples 4
+```
+
+两边必须为8000条、500次 update、global batch16、loss有限且 checkpoint 可加载。双卡
+`train_lora.seconds` 加速 `>=1.5×` 才给 LoRA 正式 run 使用双卡；否则 LoRA 保持单卡，并与其他
+单卡作业并行排程。禁止继续用 SMoPE sparse 时间代理 LoRA ETA。
+
+### 12.4 正式命令（只有对应门禁通过后才能执行）
+
+论文主方法已经冻结为 **exact full route**；`routing_scan_samples=0` 表示扫描每个任务全部过滤后
+训练样本。`routing_scan_batch_size=1` 是语义要求。先只跑 seed-0；其结果完整、指标和恢复文件
+正常后，再分别启动 seed-1/2，不使用一条长 shell 循环掩盖单 seed 失败。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+NPROC_PER_NODE=2 \
+SEEDS=0 \
+OUTPUT_ROOT=outputs/coin-qwen3.5-9b/formal-full-route \
+bash scripts/qwen/run.sh smope full \
+  --tasks ScienceQA,TextVQA,ImageNet,GQA,VizWiz,Grounding,VQAv2,OCRVQA \
+  --max-train-samples 0 \
+  --batch-size 4 --global-batch-size 16 \
+  --no-gradient-checkpointing --workers 4 \
+  --routing-scan-samples 0 --routing-scan-batch-size 1 \
+  --eval-batch-size 1 --max-eval-samples 1000 --eval-sample-seed 42
+```
+
+中断后只允许在**完全相同命令**末尾追加 `--resume`。不要修改 world size、任务顺序、seed、训练
+预算、route N、评测 N、长度或视觉预算后复用 checkpoint。
+
+LoRA 仅在 §12.3 双卡门禁通过后使用对应的双卡 full 命令；zero-shot 无训练，只运行一次，但可
+使用 `NPROC_PER_NODE=2` 通过 `ExactShard` 并行固定 N=1000 评测。论文仍报告 zero-shot、LoRA、
+SMoPE 三组；zero-shot 不能替代 LoRA。
+
+zero-shot（只运行 seed-0 一次）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+NPROC_PER_NODE=2 \
+SEEDS=0 \
+OUTPUT_ROOT=outputs/coin-qwen3.5-9b/formal-zero-shot \
+bash scripts/qwen/run.sh zero_shot full \
+  --tasks ScienceQA,TextVQA,ImageNet,GQA,VizWiz,Grounding,VQAv2,OCRVQA \
+  --workers 4 \
+  --eval-batch-size 1 --max-eval-samples 1000 --eval-sample-seed 42
+```
+
+LoRA（仅当 §12.3 双卡门禁通过；先 seed-0，完成后分别改为1/2）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+NPROC_PER_NODE=2 \
+SEEDS=0 \
+OUTPUT_ROOT=outputs/coin-qwen3.5-9b/formal-lora \
+bash scripts/qwen/run.sh lora full \
+  --tasks ScienceQA,TextVQA,ImageNet,GQA,VizWiz,Grounding,VQAv2,OCRVQA \
+  --max-train-samples 0 \
+  --batch-size 4 --global-batch-size 16 \
+  --no-gradient-checkpointing --workers 4 \
+  --eval-batch-size 1 --max-eval-samples 1000 --eval-sample-seed 42
+```
+
+若 §12.3 双卡未达到1.5×，不得使用上面的 LoRA 双卡命令；改回 `NPROC_PER_NODE=1`，其余参数
+保持不变，并将 LoRA 与另一个单卡作业并行调度。不要用 `run_all.sh`：三种方法的 seed 数、route
+行为和双卡门禁不同，一条统一循环会掩盖错误配置。
+
+### 12.5 每步必须回传和写回本文的产物
+
+- 完整输出目录：`environment.json`、`events.jsonl`、`dataset_manifest.json`、`summary.json`、
+  `accuracy_matrix.csv`、`routing/*.json`、`predictions/**`、`latest_adapter.pt`。
+- stdout/stderr 日志、运行前后 `nvidia-smi`、准确 Git SHA、开始/结束时间；不得只贴汇总表。
+- P2 的逐任务原始表、上述五项 ETA 分量、加权 route sample/s、最终门禁状态与计算脚本/命令。
+- P3 的单/双卡样本、update、loss、显存、阶段墙钟、加速比及 resume 结果。
+- 所有计划项先标“待验证”；只有原始产物齐全后才改为“已完成”。失败时保留目录，不覆盖、不删
+  cache，并在本文写明失败点和下一分支。

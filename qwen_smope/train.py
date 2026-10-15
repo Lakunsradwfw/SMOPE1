@@ -339,7 +339,14 @@ def train_epoch(network, model, loader, sampler, optimizer, scheduler, args,
     optimizer.zero_grad(set_to_none=True)
     totals = torch.zeros(7, dtype=torch.float64, device=device)
     steps = len(loader)
-    for index, batch in enumerate(loader):
+    input_wait_seconds = 0.0
+    optimizer_updates = 0
+    width_counts: dict[int, dict[str, int]] = {}
+    iterator = iter(loader)
+    for index in range(steps):
+        wait_started = time.perf_counter()
+        batch = next(iterator)
+        input_wait_seconds += time.perf_counter() - wait_started
         inputs = transfer(batch["inputs"], device)
         router_mask = transfer(batch["router_mask"], device)
         group_start = (index // args.accumulation) * args.accumulation
@@ -354,6 +361,10 @@ def train_epoch(network, model, loader, sampler, optimizer, scheduler, args,
             (result["loss"] / group_size).backward()
         tokens = int((inputs["labels"] != -100).sum())
         samples = int(inputs["input_ids"].shape[0])
+        width = int(inputs["input_ids"].shape[1])
+        width_entry = width_counts.setdefault(width, {"microbatches": 0, "samples": 0})
+        width_entry["microbatches"] += 1
+        width_entry["samples"] += samples
         totals += torch.tensor([
             float(result["lm_loss"].detach()) * tokens,
             float(result["router_loss"].detach()) * samples,
@@ -369,17 +380,39 @@ def train_epoch(network, model, loader, sampler, optimizer, scheduler, args,
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
+            optimizer_updates += 1
             if rank == 0 and ((index + 1) % (args.log_every * args.accumulation) == 0 or index + 1 == steps):
                 event(args.output, {"type": "step", "task": task_index + 1, "epoch": epoch + 1,
                                     "dense": dense, "batch": index + 1, "loss": float(result["loss"].detach()),
                                     "gradient_norm": float(norm), "lr": scheduler.get_last_lr()})
     reduce(totals)
+    wait = torch.tensor(input_wait_seconds, dtype=torch.float64, device=device)
+    reduce(wait, dist.ReduceOp.MAX)
+    gathered_widths = [None] * world
+    if dist.is_initialized():
+        dist.all_gather_object(gathered_widths, width_counts)
+    else:
+        gathered_widths = [width_counts]
+    merged_widths: dict[int, dict[str, int]] = {}
+    for rank_widths in gathered_widths:
+        for width, values in rank_widths.items():
+            entry = merged_widths.setdefault(int(width), {"microbatches": 0, "samples": 0})
+            entry["microbatches"] += int(values["microbatches"])
+            entry["samples"] += int(values["samples"])
     return {"lm_loss_per_token": float(totals[0] / max(float(totals[5]), 1.0)),
             "router_loss": float(totals[1] / max(float(totals[6]), 1.0)),
             "old_loss": float(totals[2] / max(float(totals[6]), 1.0)),
             "balance_loss": float(totals[3] / max(float(totals[6]), 1.0)),
             "loss": float(totals[4] / max(float(totals[6]), 1.0)),
-            "supervised_tokens": int(totals[5]), "samples_with_ddp_padding": int(totals[6])}
+            "supervised_tokens": int(totals[5]), "samples_with_ddp_padding": int(totals[6]),
+            # Time blocked in DataLoader.__next__. With workers=0 this includes HTTP image
+            # fetch and processor work; with workers>0 it is the non-overlapped input wait.
+            # It is intentionally measured without per-step CUDA synchronisation so the
+            # diagnostic does not distort the throughput it is meant to explain.
+            "input_wait_seconds": float(wait),
+            "optimizer_updates": optimizer_updates,
+            "sequence_widths": {str(width): merged_widths[width]
+                                for width in sorted(merged_widths)}}
 
 
 def routing_scan_indices(length: int, limit: int, seed: int,

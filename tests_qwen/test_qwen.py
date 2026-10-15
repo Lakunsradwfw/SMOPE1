@@ -14,6 +14,7 @@ from torch.nn import functional as F
 from qwen_smope.data import (CoINCollator, CoINDataset, CoINEvalCollator, CoINSample, ExactShard,
                              ImageFetcher, ImageUnavailableError, check_model,
                              subsample_records)
+from qwen_smope.compare_ddp import compare_runs, read_run
 from qwen_smope.diagnose_ddp import validate_global_batch, validate_variant_world
 from qwen_smope.filtering import (build_filter_manifest, build_filter_shard,
                                   ensure_filter_manifest, filter_signature, impact_level,
@@ -24,7 +25,7 @@ from qwen_smope.prepare_data import arguments as prepare_arguments
 from qwen_smope.report import continual_metrics, write_matrix
 from qwen_smope.scoring import box_iou, normalize_answer, normalize_vqa_answer, score_prediction
 from qwen_smope.train import (arguments, eval_dataset, record_dataset, routing_scan_indices,
-                              save_checkpoint, train_dataset)
+                              save_checkpoint, train_dataset, train_epoch)
 
 
 class FakeProcessor:
@@ -747,6 +748,42 @@ class ExpertTests(unittest.TestCase):
 
 
 class ScoringReportTests(unittest.TestCase):
+    def test_train_epoch_reports_input_wait_and_sequence_widths(self):
+        class TinyNetwork(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor(1.0))
+
+            def forward(self, inputs, router_mask, dense=False):
+                loss = self.weight.square() * inputs["input_ids"].float().mean()
+                zero = loss * 0
+                return {"loss": loss, "lm_loss": loss, "router_loss": zero,
+                        "old_loss": zero, "balance_loss": zero}
+
+        class Sampler:
+            def set_epoch(self, value):
+                self.epoch = value
+
+        batches = []
+        for samples, width in ((2, 4), (1, 8)):
+            ids = torch.ones(samples, width, dtype=torch.long)
+            batches.append({"inputs": {"input_ids": ids, "labels": ids.clone()},
+                            "router_mask": torch.ones_like(ids, dtype=torch.bool)})
+        network = TinyNetwork()
+        optimizer = torch.optim.SGD(network.parameters(), lr=0.1)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+        args = SimpleNamespace(accumulation=2, clip_grad=1.0, log_every=100, output="unused")
+        with patch("qwen_smope.train.event"):
+            stats = train_epoch(network, network, batches, Sampler(), optimizer, scheduler,
+                                args, torch.device("cpu"), 0, 0, False, 0, 1)
+        self.assertEqual(stats["samples_with_ddp_padding"], 3)
+        self.assertEqual(stats["optimizer_updates"], 1)
+        self.assertGreaterEqual(stats["input_wait_seconds"], 0.0)
+        self.assertEqual(stats["sequence_widths"], {
+            "4": {"microbatches": 1, "samples": 2},
+            "8": {"microbatches": 1, "samples": 1},
+        })
+
     def test_task_scorers(self):
         self.assertEqual(normalize_answer("The, RED car!"), "red car")
         self.assertEqual(normalize_vqa_answer("Two, cats!"), "2 cats")
@@ -817,6 +854,39 @@ class ScoringReportTests(unittest.TestCase):
         args.accumulation = 2
         with self.assertRaises(ValueError):
             validate_global_batch(args, 1)
+
+    def test_ddp_comparison_uses_throughput_and_rejects_protocol_mismatch(self):
+        def write_trace(directory, rank, ids, wall, global_batch, updates):
+            directory.mkdir(parents=True, exist_ok=True)
+            rows = [{"type": "microbatch", "sample_ids": ids}]
+            rows.append({
+                "type": "summary", "rank": rank, "wall_seconds": wall,
+                "samples_seen": len(ids), "optimizer_updates": updates,
+                "effective_global_batch_size": global_batch,
+                "nonfinite_trainable_parameters": 0,
+            })
+            (directory / f"rank-{rank}.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_trace(root / "single", 0, ["a", "b", "c", "d"], 4.0, 16, 1)
+            write_trace(root / "dual", 0, ["a", "c"], 2.0, 16, 1)
+            write_trace(root / "dual", 1, ["b", "d"], 2.0, 16, 1)
+            result = compare_runs(read_run(root / "single"), read_run(root / "dual"), 1.5)
+            self.assertTrue(result["protocol_comparable"])
+            self.assertTrue(result["passes_speedup_gate"])
+            self.assertAlmostEqual(result["useful_sample_throughput_speedup"], 2.0)
+
+            # A faster-looking run with a different global batch is not a valid
+            # training-protocol comparison.
+            write_trace(root / "mismatch", 0, ["a", "c"], 2.0, 32, 1)
+            write_trace(root / "mismatch", 1, ["b", "d"], 2.0, 32, 1)
+            mismatch = compare_runs(
+                read_run(root / "single"), read_run(root / "mismatch"), 1.5)
+            self.assertFalse(mismatch["protocol_comparable"])
+            self.assertFalse(mismatch["passes_speedup_gate"])
+            self.assertIn("effective global batch mismatch", mismatch["issues"][0])
 
     def test_parallel_filter_cli_caps_http_concurrency(self):
         args = prepare_arguments(["--scan-workers", "14"])

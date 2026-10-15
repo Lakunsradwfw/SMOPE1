@@ -2,7 +2,7 @@
 
 > 唯一权威诊断文档。本文取代原 `DIAGNOSIS.md`、`DIAGNOSIS_DDP.md`、
 > `QWEN_PERFORMANCE.md` 和 `QWEN3_5_9B_CODE_AND_ACCURACY_ANALYSIS.md`。
-> 最后更新：2026-10-14（Asia/Shanghai）。代码基线：GitHub `v2` 的
+> 最后更新：2026-10-15（Asia/Shanghai）。代码基线：GitHub `v2` 的
 > `c9bf76c98d445fd61214b11856bf45067a65479a`；本文所述新增改动已提交为
 > `4b0f436312bbd87e8bd44bb39ce09240c0fc3665`，服务器验证即在该提交上进行（§8）。
 
@@ -40,12 +40,17 @@
     （延迟 10–30ms→230ms+，个别请求 >115s 不返回）；扫描/训练并发应 ≤14。
 11. （2026-10-14 实测，§8.4）OCR-VQA 训练集镜像缺图 54/165,348（0.033%），官方
     `prepare_data` 因此永远无法完成该任务；其余 7 任务无缺图。
+12. （2026-10-15 重新核算，§8.7、§10.8）A 单卡在 58.49s 内处理 100 条，D 双卡分片在
+    72.76s 内处理 200 条。D 的单 rank 墙钟虽为 `1.24×T1`，但有用样本吞吐是
+    **2.749 vs 1.710 sample/s，即 1.608× 单卡**。因此“D 比 A 慢”是口径错误；不过 A 的
+    有效全局 batch=8、D=16，尚不能把 1.608× 当成同训练协议下的正式加速比。
 
 ### 1.2 推断
 
 - ~~多宽度 autotune 可解释一部分冷启动时间，但不能单独解释旧 DDP run 的全部非线性变慢。~~
   **2026-10-14 更新（§8.7）**：在独占 H100 上，A/B/C/D 控制实验显示 DDP 本身没有复现
-  历史非线性变慢（B 0.91×T1、C 0.99×T1、D 1.24×T1）；宽度错位预热的锁步等待确实存在，
+  历史非线性变慢（B 0.91×T1、C 0.99×T1、D 单 rank 墙钟 1.24×T1）；D 实际同时处理两倍
+  样本，有用吞吐为单卡 1.608×。宽度错位预热的锁步等待确实存在，
   但在 4 个桶宽、每宽度 ~6s 预热的规模下只值 0.24×T1。旧“慢 45 倍”更可能与当时
   环境/并发干扰（如多探针并发、服务器抖动）有关，具体成因已无法复现验证。
 - 完整 split 的剔除率并非全部 <1%：GQA 3.61%、Grounding 1.20%（material），论文实验
@@ -60,7 +65,8 @@
 - Triton 编译缓存条目没有随同形状重复探针变化；历史慢点更符合 autotune，而非每次重新编译。
 - 进程并非简单死锁：旧观测中 CPU 时间持续增长。
 - **（2026-10-14，§8.7）**“DDP 在当前代码/独占 H100 上必然慢一个数量级”——不成立；
-  B/C/D 相对单卡的实测比值 0.91/0.99/1.24。
+  B/C/D 的最慢 rank 墙钟相对单卡为 0.91/0.99/1.24；其中只有 D 做有用分片，其未经协议
+  对齐的样本吞吐为单卡 1.608×。
 
 ### 1.4 待验证问题
 
@@ -95,6 +101,7 @@
 | 2026-10-14 | `5ed8a62` + 未提交修改 | `qwen_smope/train.py`, `tests_qwen/test_qwen.py`, 本文与 `QWEN_SERVER.md` | route scan 从生成评测 batch=1 解耦，默认使用训练 batch=4；正式实验改为双卡独立 run，增加评测预算门禁与 ETA | 32/32 单测、compileall、diff check | batch 1/4 路由频次等价性与实际加速待 H100 短标定 |
 | 2026-10-15 | 基于 `5ed8a62` 的本次 smoke-speed 提交 | `qwen_smope/{data,filtering,prepare_data,train,model,diagnose_ddp}.py`, `tests_qwen/test_qwen.py`, 本文与 `QWEN_SERVER.md` | 缺图分级与重试、分片过滤缓存、批量评测、确定性有限 route scan、checkpointing 对照开关及服务器逐步判据 | 34/34 单测、compileall、diff check | H100 上 T/E/R/C 各阶段均待验证；提交后在下一条记录补充精确 SHA |
 | 2026-10-15 | 实现提交 `83ef103` | 上述 9 个文件 | 将本轮实现、测试与 DeepSeek 执行单固化为可追溯提交 | 34/34 单测、compileall、diff check | 本条仅回填 SHA；H100 结论仍全部待验证 |
+| 2026-10-15 | `e907170` + 本地待提交修改 | `qwen_smope/compare_ddp.py`, `qwen_smope/train.py`, `tests_qwen/test_qwen.py`, 本文与 `QWEN_SERVER.md` | 修正 DDP 墙钟/吞吐口径；增加协议匹配 E/F 自动审计；epoch 增加 input wait 与宽度分布 | 36 项单测、compileall、diff check（完成后回填） | E/F 与生产 8000 条单/双卡对照待独占 H100 |
 
 本地验证环境没有可容纳 9B 模型的 GPU，也没有服务器 CoIN 数据，所以没有伪造 smoke/DDP
 完成结果。已执行：
@@ -378,15 +385,17 @@ reason full_length_exceeds_max_length`。注意其 prompt 本身（1293）已超
 `verify-20261014/ddp/*-nvidia-smi-*.txt`）。原始 trace：各阶段 `rank-*.jsonl` 与
 `configuration.json`；汇总 `verify-20261014/ddp/summary.json`。
 
-| 阶段 | 变体 | 最慢 rank 墙钟 | 相对 T1 | 判据 ≤2×T1 | 备注 |
-|---|---|---|---|---|---|
-| A | single | **58.5s（T1）** | 1.00 | — | 首次 microbatch fwd+bwd 21.6s（预热），稳态中位 0.462s |
-| B | multiprocess-independent | 53.5s | 0.91 | 通过 | 两进程不包 DDP，无异常 |
-| C | ddp-same-batch | 57.9s | 0.99 | 通过 | 两 rank loss 与样本 ID **完全一致** |
-| D | ddp-sharded | 72.8s | 1.24 | 通过 | 两 rank 样本不相交；但可见明确机制性变慢 |
+| 阶段 | 变体 | 最慢 rank 墙钟 | 全局有用样本 | 有用吞吐 | 备注 |
+|---|---|---:|---:|---:|---|
+| A | single | **58.5s（T1）** | 100 | 1.710 sample/s | 首次 microbatch fwd+bwd 21.6s（预热），稳态中位 0.462s |
+| B | multiprocess-independent | 53.5s | 两份相同的 100 | 不合并（两个独立作业） | 两进程不包 DDP，无异常 |
+| C | ddp-same-batch | 57.9s | 100（两 rank 重复） | 1.726 sample/s | 只隔离 DDP 包装成本，不是数据并行提速实验 |
+| D | ddp-sharded | 72.8s | 200（两 rank 不相交） | **2.749 sample/s（A 的 1.608×）** | 有错位预热等待，但有效吞吐仍更高 |
 
-**结论**：在独占 H100 上，历史“DDP 慢 45 倍/1174 秒”**没有复现**；B、C 与单卡几乎同速，
-D 的 1.24×T1 也远低于 2× 判据。
+**结论**：在独占 H100 上，历史“DDP 慢 45 倍/1174 秒”**没有复现**；B、C 与单卡几乎同速。
+旧汇总只给出 D 的单 rank 墙钟 `1.24×T1`，容易误读为双卡更慢；按全局不重复样本计算，D
+实际得到 **1.608× 有用吞吐**。但 A/D 的有效全局 batch 分别为 8/16，严格训练协议结论仍以
+§9.4 的 E/F 为准。
 
 **D 变慢的机制（逐 microbatch 分析，值得记录）**：
 
@@ -479,7 +488,7 @@ D 的 1.24×T1 也远低于 2× 判据。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m qwen_smope.diagnose_ddp \
-  --variant single --output outputs/coin-qwen3.5-9b/verify-20261014/ddp/E-single-gbs16 \
+  --variant single --output outputs/coin-qwen3.5-9b/verify-20261015b/ddp/E-single-gbs16 \
   --model-path /dev/shm/qwen35-9b --coin-root /mnt/zq/SMOPE/coin_local \
   --image-transport http --filter-cache outputs/coin-qwen3.5-9b/_filter_cache \
   --steps 400 --batch-size 4 --accumulation 4 --global-batch-size 16
@@ -490,7 +499,7 @@ CUDA_VISIBLE_DEVICES=0 python -m qwen_smope.diagnose_ddp \
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
   -m qwen_smope.diagnose_ddp \
-  --variant ddp-sharded --output outputs/coin-qwen3.5-9b/verify-20261014/ddp/F-ddp-gbs16 \
+  --variant ddp-sharded --output outputs/coin-qwen3.5-9b/verify-20261015b/ddp/F-ddp-gbs16 \
   --model-path /dev/shm/qwen35-9b --coin-root /mnt/zq/SMOPE/coin_local \
   --image-transport http --filter-cache outputs/coin-qwen3.5-9b/_filter_cache \
   --steps 200 --batch-size 4 --accumulation 2 --global-batch-size 16
@@ -677,11 +686,13 @@ seed 分别运行 `--routing-scan-samples 1000`、`5000`、`10000`；`--routing-
 | route batch 1/4 | **已完成（2026-10-15，§10.3）**：速度 0.443× 通过，但整数频次 1,614/3,200 不一致 | routing-scan batch 跟随已冻结物理 batch | **等价性不通过 → 退回 1** |
 | route 1000/5000/10000 | **已完成（2026-10-15，§10.3）**：5000-vs-10000 99.625% 合格（§9.7.4 口径）；5000-vs-全量 99.438% 不合格（§9.6 口径），10000-vs-全量 99.750% | 稳定的最小 N 与 seed=42 | 提高 N 或全量 |
 | no-checkpointing | **已完成（2026-10-15，§10.4）**：0.722×（≥15% 判据通过），峰值 51.0 GiB < 72 GiB | 仅在显存和 15% 判据通过时关闭 | 保持开启 |
-| 单 seed 正式实验 | **禁止启动** | 所有必需项冻结且维护者确认 | 继续标定 |
+| 单 seed 正式实验 | **暂不启动（见 §10.6）**：当前约 32.2h 的中心值来自 workers=0/GQA 外推，LoRA 未实测 | 所有必需项冻结且维护者确认 | 先完成真实 full 输入流水线与 LoRA 吞吐标定 |
 
-最终候选（不是授权开跑）为：global batch 16、物理 batch 8/16、eval batch 4、固定评测
-N=1000、route scan N=5000/seed=42、两张卡各跑一个独立单卡方法。所有结果必须先写回本节状态表
-并附原始产物路径；只有维护者确认 ETA <=24h 且语义判据通过，才启动 GPU0 LoRA / GPU1 SMoPE。
+§10 标定后的**当前临时基线**（仍不是授权开跑）为：global batch 16、物理 batch 4、noGC、
+eval batch 1、固定评测 N=1000、route batch 1、route N=10000/seed=42（N 仍须训练后状态复核），
+两张卡各跑一个独立单卡方法。batch 8、eval batch 4、route batch 4 和 route N=5000 均不得沿用
+旧“候选”措辞静默启用。只有 §10.6 的输入流水线与 LoRA 标定完成、最终 ETA 和路由 N 获维护者
+确认后，才启动 GPU0 LoRA / GPU1 SMoPE。
 
 ## 10. 服务器标定记录（2026-10-15，`8123181`）
 
@@ -866,7 +877,210 @@ N 稳定性序列（1000/5000/10000/full，seed 42）随即在 **batch 1** 下�
 按冻结设置（noGC、scan batch 1、eval batch 1）的算术示例——**单方法单 seed**：
 训练 sparse 570,260×0.158≈25.0h；SMoPE dense 12,726×0.196≈0.7h（LoRA 无）；
 route scan N=5000×8 任务≈1.1h（N=10000≈2.1h）；评测（N=1000/任务、36 个矩阵单元按逐任务
-实测速率）≈4.8h；即 SMoPE ≈31.5h、LoRA ≈29.8h、zero-shot ≈1.1h。**这些是 workers=0
+实测速率）原记录粗算≈4.8h；即 SMoPE ≈31.5h、LoRA ≈29.8h、zero-shot ≈1.1h。**这些是 workers=0
 标定口径下的算术**；full 模式 workers=4 的流水线重叠未参与标定，实际可能偏移，维护者
 应按正式设置复核后再冻结 ETA。若 N=5000 按 §9.7.4 口径采用，单 seed 双卡并行（LoRA/SMoPE）
 的墙钟估计仍在 30h 量级，超出 §9.6 的 16–24h 目标，主要瓶颈是训练吞吐而非评测或扫描。
+
+### 10.6 维护者复核：25 小时的含义、修正 ETA 与下一步（2026-10-15）
+
+本地已取得 `verify-20261015/` 的 93 个文件（约 43.2 MB），核对了 events、environment、
+predictions/routing、三份对照脚本与日志。以下结论取代 §10.5 的粗算，但不把未跑的实验写成
+结果。
+
+#### 10.6.1 先纠正两个口径
+
+1. **25 小时不是 davfs 挂载传输时间，也不是纯 GPU 计算时间。**标定的
+   `environment.json` 明确是 `image_transport=http`；davfs 没进入训练热路径。但 T/C 标定按
+   §9.7 使用 `workers=0`，因此每个 batch 的 HTTP 取图、processor/chat template 与 GPU
+   前后向串行计入 `train_sparse`。full 默认 `workers=4` 会预取并重叠这些工作，所以把
+   0.158 s/样本直接乘 570,260 会系统性偏向保守。现有 events 没有逐步 input-wait，尚不能把
+   25 小时拆成“网络多少、GPU 多少”。
+2. **标准 full 入口本身没有 route 数据源偏差。**full 且 `max_train_samples=0` 时，
+   `train_set` 就是完整过滤集。偏差只发生在本轮缩短训练的 calibration：smoke 会先截断
+   `train_set`，外置脚本虽恢复了完整扫描源，却使用未训练路由器。因此它足以否决 batch=4 的
+   逐字节等价性，但 N 稳定性不能冒充“训练后路由器”的最终证据。
+
+#### 10.6.2 修正后的单 seed 算术
+
+持续评测不是“八任务平均耗时 ×36”。任务顺序固定时，ScienceQA 到 OCRVQA 在三角矩阵中分别
+出现 8、7、6、5、4、3、2、1 次。用 E1 原始逐任务时间加权，`N=1000` 的正式矩阵为
+**4.32h**，不是 §10.5 的 4.8h。
+
+| 方案 | 当前可算部分（每 seed） | 中心值 | 证据边界 |
+|---|---|---:|---|
+| Qwen3.5 zero-shot | 8 任务各评测 1000 条 | **1.07h** | 由 E1 800 条线性外推；无训练 |
+| LoRA | sparse 训练代理 25.07h + 矩阵评测 4.32h | **29.39h（仅代理）** | 没有任何 LoRA 训练标定，不能冻结 |
+| SMoPE，route N=5000 | sparse 25.07h + dense 0.69h + route 1.09h + eval 4.32h | **31.17h** | N=5000 未通过 full-reference 口径 |
+| SMoPE，route N=10000 | sparse 25.07h + dense 0.69h + route 2.14h + eval 4.32h | **32.22h** | 10000-vs-full 通过，但路由器状态有偏差 |
+| SMoPE，全量 route | sparse 25.07h + dense 0.69h + route 约15.3h + eval 4.32h | **约45.4h** | 最保守，不满足一天目标 |
+
+两张 H100 分别跑 LoRA 与 SMoPE 时，zero-shot 可排在较短的 LoRA 卡上，故当前一 seed 最优
+调度的中心墙钟约 **32.2h**，不是三者相加；单卡串行则约 **62.7h**。三 seed、两卡的理论
+下界约 94h（3.9 天），实际应留 4–5 天。SMoPE 的 32.2h 已经是上述“一 seed 中心估算”的
+主导项；它不会在这个数字之外再额外加一次 32h，但若最终必须全量 route，则会升到约45h。
+
+上述中心值仍不是正式 ETA：它把 GQA/ScienceQA 吞吐外推到八任务，且 LoRA 用 SMoPE sparse
+冒充。当前应给 **30–40h/seed 的工作区间**，不能承诺 24h。
+
+#### 10.6.3 瓶颈与能否压到 24 小时
+
+按 N=10000 的 32.22h 代理分解：sparse 训练约 25.07h（77.8%）、评测 4.32h（13.4%）、
+route 2.14h（6.6%）、dense 0.69h（2.2%）。评测/route 的 batch>1 都已因语义不等价被否决，
+增大 global batch 又不会减少样本前后向。在本节原先假定的**单卡执行口径**下，能覆盖缺口的
+首要方向是训练输入流水线与 GPU 计算重叠；§10.8 进一步纠正了 DDP 吞吐口径。若其他项不变，
+要达到 24h，sparse 必须从 0.158 降到不高于
+**0.106 s/样本（再快约32.8%）**。
+
+现有证据说明这个目标“有可能，但未证明”：过滤侧测得 HTTP+模板+processor 约 0.103s/样本，
+而 noGC sparse 总计 0.158s/样本；T4→T8 几乎不提速也符合按样本串行输入占比较大的形态。
+full 的 4 个 worker 若能把输入隐藏在 GPU 计算后面，可能一次覆盖 33% 缺口。反过来，如果
+workers=4 后仍高于 0.106s/样本，就不能靠 total/global batch 或 optimizer 调参解决。
+
+代码现增加无同步扰动的 `input_wait_seconds` 与 `sequence_widths` epoch 字段；前者记录阻塞在
+DataLoader 的墙钟，后者揭示 padding/桶宽构成。下一轮只跑以下三个门禁，不启动正式 full：
+
+1. **P1（最关键）**：SMoPE、noGC、batch=4、GQA 8000，先 workers=4；以已有 workers=0
+   0.158s/样本作保守参照，并读取 `input_wait_seconds/train_sparse.seconds`。若总吞吐达到
+   ≤0.106s/样本，24h 目标在算术上成立；否则进入 P2。
+2. **P2（条件执行）**：在 P1 同配置下只把物理 batch 改为 8（global batch 仍16，accumulation
+   自动为2）。此前 T8 是 GC+workers=0 口径，不能代表 noGC+流水线重叠后的扩展性。要求峰值
+   <72GiB、样本/有限值正常且比 P1 再快至少15%。
+3. **P3（必须）**：用 P1/P2 获胜设置跑 LoRA GQA 8000，得到 LoRA 自己的 s/样本与显存；
+   禁止继续用 SMoPE 代理。随后只对获胜设置做八任务各 2000 条的代表性 smoke，按任务吞吐
+   重算最终 ETA。
+
+若 P2 后仍达不到 0.106s/样本，再做代码级 A/B，而不是启动 full：当前 SMoPE
+`expert_attention` 把普通 Q/K 显式转成 FP32 后矩阵乘；Transformers 官方 eager 路径是原生
+dtype matmul、仅 softmax 用 FP32。这是最具体的 GPU 优化候选，但会改变数值路径，必须以固定
+样本比较 loss、梯度有限性、路由选择和吞吐后才能采用。另一个候选是基于实际
+`sequence_widths` 做确定性的长度分组；它会改变训练顺序，属于研究协议变更，优先级低于前者。
+
+### 10.7 论文主实验口径：基线与 route 版本决策
+
+导师提出的“与原始 Qwen3.5-9B 比较是否掉点”和“SMoPE 是否有效”是两个不同问题，不能只用
+一个对照回答：
+
+| 运行 | 回答的问题 | 论文角色 |
+|---|---|---|
+| frozen Qwen3.5-9B zero-shot | 加入持续学习后，相对基础模型的同一固定评测集性能升降 | 必需基础线；无训练，只跑一次 |
+| sequential LoRA | 在同样顺序、训练样本和评测预算下，SMoPE 是否优于普通参数高效持续微调 | 必需主要基线；与 SMoPE 使用相同训练 seed |
+| SMoPE | 是否提高 New.ACC/MAA/BWT、降低 forgetting，并说明额外时间/显存/参数代价 | 论文主方法 |
+
+因此论文至少报告三者；只比较 zero-shot 不能证明 SMoPE 优于持续微调，只比较 LoRA 又不能回答
+基础模型能力是否下降。zero-shot 是确定性基线，固定评测 ID 后无需机械重复三个 seed；LoRA 与
+SMoPE 建议三个 seed 报 mean±std。若只跑一个训练 seed，只能称为 pilot，不应包装成稳定结论。
+
+主表必须统一：任务顺序、过滤后的训练清单、eval N=1000 与 seed=42、batch=1 生成、最大长度、
+视觉预算和 scorer。报告每任务 zero-shot、最终 accuracy、MAA、New.ACC、BWT、forgetting，另列
+训练 GPU-hours、峰值显存和可训练参数。SMoPE 第一任务有 dense+sparse 两次遍历，而 LoRA 只有
+一次，必须在 compute/sample exposure 栏明说；若增益很小，应补匹配计算量的 LoRA 控制，不能
+把多一次遍历带来的收益全部归因于框架。
+
+**route 的论文决策：主结果用 full，N=10000 只作效率消融。**原因不是 99.75% 是否看起来够高，
+而是当前 `frequency` 跨任务累加原始计数：full 下 OCRVQA 165,294 条对累计频率的权重约为
+ScienceQA 12,726 条的 13 倍；固定每任务 N=10000 会把任务贡献近似等权，属于算法口径变化。
+单任务、未训练路由器上的 protected 一致率无法验证这个跨任务差异。
+
+若最终受算力限制必须把 N=10000 作为主方法，应明确命名为 sampled/均衡版 SMoPE，披露 N 与
+seed，并至少在一个**训练后、跨任务累计状态**上与 full 比较 protected 集及最终指标；否则不能
+声称它就是 full SMoPE 的无损提速。§10.5 的 full route 约15.3h同样来自 workers=0 驱动脚本，
+不是最终成本；生产 full 的 workers=4、batch=1 route 必须先实测，优先用输入预取加速 exact
+full，而不是先改算法权重。
+
+### 10.8 双卡吞吐口径纠正与恢复 DDP 的执行门禁（2026-10-15）
+
+#### 10.8.1 原结论错在哪里
+
+§8.7 的 `ratio_to_T1` 比较的是“每个 rank 跑完 25 个 microbatch 的墙钟”，不是全局有用
+样本吞吐。A 在 58.486s 处理 `25×4=100` 条，D 的两个 rank 各在约72.76s处理100条且样本
+不相交，所以：
+
+```text
+A throughput = 100 / 58.486 = 1.710 sample/s
+D throughput = 200 / 72.757 = 2.749 sample/s
+D/A          = 1.608×
+```
+
+因此现有证据不是“双卡反而更慢”，而是“双卡有用吞吐快约61%但冷启动/锁步使扩展效率只有
+80.4%”。真正未回答的是：A 用 `batch4×acc2×world1=8`，D 用
+`batch4×acc2×world2=16`；它们没有保持相同有效全局 batch 和 optimizer update，不能直接作为
+论文训练协议的加速结论。
+
+#### 10.8.2 一天目标的意义
+
+若 1.608× 能在协议匹配的长标定中保持：
+
+- 只把 25.07h sparse 训练并行化，N=10000 的保守估计为
+  `25.07/1.608 + 0.69 + 2.14 + 4.32 = 22.74h`；已低于一天。
+- 若 dense、route 和 eval 的现有分片也取得相同扩展，N=10000 的理想估计约
+  `32.22/1.608 = 20.04h`。
+- full-route 即使所有阶段同样 1.608×，仍约 `45.4/1.608 = 28.2h`；所以双卡本身不足以保证
+  full-route 一天内完成，仍需 workers=4 的实测收益或接近2×的扩展。
+
+这些是外推，不是新实测。DDP 会缩短单 run 墙钟，但通常不会降低 GPU-hours；论文需同时报告
+墙钟与 GPU-hours。
+
+#### 10.8.3 P0：先完成严格 E/F（约十分钟级，不启动 full）
+
+沿用 §9.4 命令：E 单卡为 batch=4、accumulation=4，F 双卡每 rank batch=4、
+accumulation=2；两者 global batch=16、全局样本1600、optimizer update=100。完成后运行新增的
+自动审计：
+
+```bash
+python -m qwen_smope.compare_ddp \
+  --single outputs/coin-qwen3.5-9b/verify-20261015b/ddp/E-single-gbs16 \
+  --dual outputs/coin-qwen3.5-9b/verify-20261015b/ddp/F-ddp-gbs16 \
+  --min-speedup 1.5 \
+  --output outputs/coin-qwen3.5-9b/verify-20261015b/ddp/ef-comparison.json
+```
+
+分析器同时检查：global batch、optimizer update、两边全局 sample ID 集合、DDP rank 间重复、
+非有限参数和错误记录；只有协议完全可比且有效吞吐至少 **1.5×** 才通过。1.5×不是为了数字
+好看，而是给 32.2h→24h 留出必要余量。旧 A/D 因 trace schema 较旧且 global batch 不同，
+只作机制证据，不应伪装成通过本门禁。
+
+#### 10.8.4 P1-DDP：再用真实训练入口验证生产收益
+
+E/F 通过后，在独占两卡上对同一 GQA 前8000个过滤后样本跑生产单/双卡；除 world size 和由
+CLI 自动推导的 accumulation 外不改任何变量。先单卡，回传完成后再双卡：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 NPROC_PER_NODE=1 \
+OUTPUT_ROOT=outputs/coin-qwen3.5-9b/verify-20261015b/prod-single-gbs16 \
+bash scripts/qwen/run.sh smope smoke \
+  --tasks GQA --max-train-samples 8000 \
+  --batch-size 4 --global-batch-size 16 \
+  --no-gradient-checkpointing --workers 4 \
+  --eval-batch-size 1 --max-eval-samples 4 \
+  --routing-scan-samples 1 --routing-scan-batch-size 1
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 NPROC_PER_NODE=2 \
+OUTPUT_ROOT=outputs/coin-qwen3.5-9b/verify-20261015b/prod-ddp-gbs16 \
+bash scripts/qwen/run.sh smope smoke \
+  --tasks GQA --max-train-samples 8000 \
+  --batch-size 4 --global-batch-size 16 \
+  --no-gradient-checkpointing --workers 4 \
+  --eval-batch-size 1 --max-eval-samples 4 \
+  --routing-scan-samples 1 --routing-scan-batch-size 1
+```
+
+生产门禁：两边 epoch 事件的 `samples_with_ddp_padding=8000`、有效 global batch=16、
+`optimizer_updates=500`，loss有限、checkpoint 可加载；双卡 `train_sparse.seconds` 至少快1.5×。
+同时比较新记录的
+`input_wait_seconds` 和 `sequence_widths`。若 E/F 通过但生产未达1.5×，先用逐 rank 宽度顺序
+判断是否为错位 autotune；只有该证据成立才实现同序桶宽预热，不能先开 static graph、调 DDP
+bucket 或升级依赖碰运气。
+
+#### 10.8.5 正式调度决策
+
+- 若 P0 与 P1-DDP 均通过：单个 SMoPE seed 改用双卡 DDP，目标区间先按 N=10000
+  **约20–23h**；实际 ETA 用八任务各2000条获胜配置复算。`run.sh` 暂不静默修改默认值，正式
+  命令必须显式 `NPROC_PER_NODE=2`，避免历史脚本无意改变硬件预算。
+- 若加速 <1.5×：双卡仍可能缩短单 run，但为整个论文矩阵，两张卡各跑 LoRA/SMoPE 或不同 seed
+  通常有更高作业吞吐。不要为了“用了 DDP”牺牲总 makespan。
+- 论文主方法仍按 §10.7 用 full route；DDP 只改变执行并行度，不解决 N=10000 与 full 的算法
+  口径差异。若 full route 一天目标不成立，应诚实报告更长时间，或把 sampled 版作为明确命名的
+  效率变体，不能偷偷替换主方法。

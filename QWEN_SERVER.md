@@ -146,6 +146,61 @@ bash scripts/qwen/run.sh smope smoke --max-length 512 --max-visual-tokens 128
 `--batch-size`，保持 `max-length=1024`、`max-visual-tokens=256`、global batch 与样本不变；否则
 速度结果不具可比性。
 
+### 下载产物复核后的唯一下一步（§10.8）
+
+旧 DDP 汇总的 `D=1.24×T1` 是单 rank 墙钟，不是有用吞吐。A 单卡处理100条/58.49s，D 双卡
+处理200条/72.76s，未经协议对齐的有用吞吐实际为 **1.608×**。先拉取包含
+`qwen_smope.compare_ddp` 与 `input_wait_seconds`/`sequence_widths` 的新提交，按交接文档 §9.4
+依次跑 E、F（global batch 均为16），然后执行：
+
+```bash
+python -m qwen_smope.compare_ddp \
+  --single outputs/coin-qwen3.5-9b/verify-20261015b/ddp/E-single-gbs16 \
+  --dual outputs/coin-qwen3.5-9b/verify-20261015b/ddp/F-ddp-gbs16 \
+  --min-speedup 1.5 \
+  --output outputs/coin-qwen3.5-9b/verify-20261015b/ddp/ef-comparison.json
+```
+
+只有 `protocol_comparable=true` 且 `passes_speedup_gate=true` 才进入生产 P1 单/双卡8000条对照。
+先跑单卡：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+NPROC_PER_NODE=1 \
+OUTPUT_ROOT=outputs/coin-qwen3.5-9b/verify-20261015b/prod-single-gbs16 \
+bash scripts/qwen/run.sh smope smoke \
+  --tasks GQA --max-train-samples 8000 \
+  --batch-size 4 --global-batch-size 16 \
+  --no-gradient-checkpointing --workers 4 \
+  --eval-batch-size 1 --max-eval-samples 4 \
+  --routing-scan-samples 1 --routing-scan-batch-size 1
+```
+
+单卡完成并回传后，保持参数不变，仅切换 world size（CLI 会把 accumulation 从4自动改为2）：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+NPROC_PER_NODE=2 \
+OUTPUT_ROOT=outputs/coin-qwen3.5-9b/verify-20261015b/prod-ddp-gbs16 \
+bash scripts/qwen/run.sh smope smoke \
+  --tasks GQA --max-train-samples 8000 \
+  --batch-size 4 --global-batch-size 16 \
+  --no-gradient-checkpointing --workers 4 \
+  --eval-batch-size 1 --max-eval-samples 4 \
+  --routing-scan-samples 1 --routing-scan-batch-size 1
+```
+
+回传两个完整目录与 `train_sparse` 的 seconds，以及 epoch 事件中的
+samples_with_ddp_padding、input_wait_seconds、sequence_widths、optimizer_updates，再附峰值显存和
+checkpoint 加载结果。双卡至少快 **1.5×** 才恢复为单 run 正式
+方案；现有1.608×若能保持，N=10000 每 seed 保守约22.7h、理想约20.0h。若未通过，先依据
+rank 间宽度顺序决定是否做同序预热；不要自行开 static graph/DDP bucket 或升级依赖。
+
+论文主表按交接文档 §10.7 使用 frozen zero-shot、sequential LoRA、SMoPE 三组。正式 SMoPE
+主结果暂按 **full route** 设计；N=10000 只能作为 sampled 效率消融，因为固定每任务 N 会改变
+跨任务累计频率的样本量权重。先通过 P1 测 workers=4 的输入重叠，再单独标定 exact full route
+在 workers=4、batch=1 下的时间；不要沿用 workers=0 的15.3h估算直接放弃 full。
+
 ## 输出
 
 默认输出为 `outputs/coin-qwen3.5-9b/<method>/<mode>/seed-<seed>/`：

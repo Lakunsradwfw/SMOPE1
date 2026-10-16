@@ -1,8 +1,9 @@
 # Qwen3.5-9B + CoIN 实验说明
 
 smoke 性能、超长样本过滤、DDP 诊断的唯一当前结论与服务器执行顺序见
-[`SMOKE_OPTIMIZATION_HANDOFF.md`](SMOKE_OPTIMIZATION_HANDOFF.md)。本文只说明常规运行接口；
-在独占 H100 的 A/B/C/D 原始产物完成前，不把 DDP 作为默认，也不报告加速倍数。
+[`SMOKE_OPTIMIZATION_HANDOFF.md`](SMOKE_OPTIMIZATION_HANDOFF.md)。P0/P1/P3 已通过；P2 因最后
+一个评测对象集合挂起而未完成。服务器当前只执行交接文档 **§12.8 的 Gloo 修复后 resume**，
+通过前不启动正式 seed-0。
 
 本入口在 CoIN 八任务上运行三种可比较配置，全部从 post-trained 多模态
 `Qwen/Qwen3.5-9B` 开始，不再支持旧的 Base+CIFAR/CUB/ImageNet-R 分类实验。
@@ -24,6 +25,7 @@ smoke 性能、超长样本过滤、DDP 诊断的唯一当前结论与服务器�
 conda create -n smope-coin python=3.11 -y
 conda activate smope-coin
 bash scripts/qwen/setup.sh
+python -c "import peft; assert peft.__version__ == '0.18.1'; print(peft.__version__)"
 ```
 
 本地模型默认位于 `pretrained/Qwen3.5-9B/`，必须是
@@ -84,9 +86,8 @@ SEEDS="0 1 2" bash scripts/qwen/run.sh lora full
 SEEDS="0 1 2" bash scripts/qwen/run.sh smope full
 ```
 
-`scripts/qwen/run.sh` 默认 `NPROC_PER_NODE=1`。`NPROC_PER_NODE=2` 仅用于交接文档中的受控 DDP
-诊断，不能直接作为正式默认。诊断入口是 `python -m qwen_smope.diagnose_ddp`，必须严格按
-single → multiprocess-independent → ddp-same-batch → ddp-sharded 的顺序执行。
+`scripts/qwen/run.sh` 默认 `NPROC_PER_NODE=1`；这个安全默认不变。P0/P1/P3 已授权交接文档
+§12.4 的正式命令显式设置 `NPROC_PER_NODE=2`，但必须先完成 §12.8 的 P2 resume 门禁。
 
 默认任务顺序为论文随机顺序：
 
@@ -119,7 +120,16 @@ HTTP 图片通道和 `--length-bucket=128`。SMoPE 路由统计默认使用
 峰值显存、非有限值、样本计数和吞吐判据全部通过后，才冻结更大的物理 batch。可用
 `--no-gradient-checkpointing` 做独立对照，但它不是默认值，也不能与 batch 调整同时首测。
 
-## 2026-10-15：24 小时目标的服务器执行入口
+## 2026-10-16：服务器唯一下一步
+
+不要从下面的历史标定章节继续挑实验。先拉取 `v2` 最新提交，然后严格执行
+[`SMOKE_OPTIMIZATION_HANDOFF.md` §12.8](SMOKE_OPTIMIZATION_HANDOFF.md)：检查 task7 checkpoint，
+用原 P2 命令追加 `--resume`，验证独立 Gloo 对象组完成 OCRVQA 与末轮8个评测 cell。四项判据
+全部通过后直接启动 §12.4 的 SMoPE exact-full-route seed-0。LoRA 正式配置已经裁定为双卡、
+batch4、global batch16、**保留默认 gradient checkpointing**；不得再加
+`--no-gradient-checkpointing`。
+
+## 2026-10-15：24 小时目标的历史执行入口
 
 本轮代码实现提交是 `83ef103`；服务器应拉取 GitHub `v2` 的最新 HEAD（其后还有回填 SHA 的文档
 提交），并用 `git log -2 --oneline` 确认历史中包含 `83ef103` 后再开始。
@@ -148,8 +158,8 @@ bash scripts/qwen/run.sh smope smoke --max-length 512 --max-visual-tokens 128
 
 ### 历史 DDP 门禁（已完成；不要重跑）
 
-P0 E/F 与 P1-DDP 已通过，结果和原始路径见交接文档 §11。当前唯一下一步已更新为交接文档
-**§12.2 的八任务各8000条 ETA 标定**；按 §12 的硬判据回传后，才进入 LoRA 门禁和正式 full。
+P0 E/F 与 P1-DDP 已通过，结果和原始路径见交接文档 §11。当时的下一步是交接文档 §12.2
+八任务各8000条 ETA 标定；该轮现已执行并在最后一个评测 cell 挂起，后续改由 §12.8 接管。
 下面命令仅保留作历史审计，不再是当前执行单。
 
 旧 DDP 汇总的 `D=1.24×T1` 是单 rank 墙钟，不是有用吞吐。A 单卡处理100条/58.49s，D 双卡

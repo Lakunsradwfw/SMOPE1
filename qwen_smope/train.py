@@ -6,6 +6,7 @@ import contextlib
 from datetime import timedelta
 import gc
 import hashlib
+from importlib import metadata
 import json
 import math
 import multiprocessing as mp
@@ -40,6 +41,8 @@ from .scoring import score_prediction
 WORKER_START_METHODS = tuple(
     method for method in ("forkserver", "spawn") if method in mp.get_all_start_methods())
 DEFAULT_WORKER_START_METHOD = "forkserver" if "forkserver" in WORKER_START_METHODS else "spawn"
+OBJECT_COLLECTIVE_TIMEOUT = timedelta(minutes=10)
+_OBJECT_COLLECTIVE_GROUP = None
 
 
 def arguments(argv: list[str] | None = None, world_size: int | None = None) -> argparse.Namespace:
@@ -166,6 +169,43 @@ def arguments(argv: list[str] | None = None, world_size: int | None = None) -> a
 def sync() -> None:
     if dist.is_initialized():
         dist.barrier()
+
+
+def initialize_distributed(world: int):
+    """Use NCCL for tensors and a blocking CPU/Gloo group for Python objects.
+
+    ``all_gather_object`` on an NCCL group serializes through CUDA tensors.  That
+    made tiny prediction/metadata gathers depend on outstanding CUDA stream
+    state and was the blocked path in a late-run two-rank H100 hang.  Keeping
+    tensor collectives on NCCL while moving Python objects to Gloo preserves the
+    training protocol and removes that CUDA synchronization path.
+    """
+    global _OBJECT_COLLECTIVE_GROUP
+    if world <= 1:
+        _OBJECT_COLLECTIVE_GROUP = None
+        return None
+    if not dist.is_gloo_available():
+        raise RuntimeError("DDP requires PyTorch with Gloo support for safe object collectives")
+    dist.init_process_group("nccl", timeout=timedelta(minutes=90))
+    _OBJECT_COLLECTIVE_GROUP = dist.new_group(
+        backend="gloo", timeout=OBJECT_COLLECTIVE_TIMEOUT)
+    return _OBJECT_COLLECTIVE_GROUP
+
+
+def all_gather_objects(value: Any, *, label: str, world: int) -> list[Any]:
+    """Gather small Python values on Gloo and fail on collective-order drift."""
+    if not dist.is_initialized():
+        return [value]
+    if _OBJECT_COLLECTIVE_GROUP is None:
+        raise RuntimeError("Object collective group was not initialized")
+    gathered = [None] * world
+    envelope = {"label": label, "payload": value}
+    dist.all_gather_object(gathered, envelope, group=_OBJECT_COLLECTIVE_GROUP)
+    labels = [item.get("label") if isinstance(item, dict) else None for item in gathered]
+    if any(item is None or labels[index] != label for index, item in enumerate(gathered)):
+        raise RuntimeError(
+            f"Object collective order mismatch at {label!r}; rank labels={labels!r}")
+    return [item["payload"] for item in gathered]
 
 
 def reduce(tensor: torch.Tensor, op=None) -> torch.Tensor:
@@ -320,13 +360,10 @@ def stage(args, name: str, task: int, device: torch.device, rank: int, world: in
         torch.cuda.synchronize(device)
         elapsed = torch.tensor(time.perf_counter() - started, dtype=torch.float64, device=device)
         reduce(elapsed, dist.ReduceOp.MAX)
-        memories = [None] * world
         local = {"rank": rank, "allocated_gib": torch.cuda.max_memory_allocated(device) / 2**30,
                  "reserved_gib": torch.cuda.max_memory_reserved(device) / 2**30}
-        if dist.is_initialized():
-            dist.all_gather_object(memories, local)
-        else:
-            memories = [local]
+        memories = all_gather_objects(
+            local, label=f"stage:{task}:{name}:memory", world=world)
         if rank == 0:
             event(args.output, {"type": "stage", "stage": name, "task": task + 1,
                                 "seconds": float(elapsed), "memory": memories})
@@ -388,11 +425,10 @@ def train_epoch(network, model, loader, sampler, optimizer, scheduler, args,
     reduce(totals)
     wait = torch.tensor(input_wait_seconds, dtype=torch.float64, device=device)
     reduce(wait, dist.ReduceOp.MAX)
-    gathered_widths = [None] * world
-    if dist.is_initialized():
-        dist.all_gather_object(gathered_widths, width_counts)
-    else:
-        gathered_widths = [width_counts]
+    gathered_widths = all_gather_objects(
+        width_counts,
+        label=f"train:{task_index}:{epoch}:{'dense' if dense else 'sparse'}:widths",
+        world=world)
     merged_widths: dict[int, dict[str, int]] = {}
     for rank_widths in gathered_widths:
         for width, values in rank_widths.items():
@@ -494,11 +530,8 @@ def evaluate_task(model: QwenCoINModel, dataset, collator, processor, args, devi
             totals += torch.tensor([scored["score"], 1.0], dtype=torch.float64, device=device)
             local_rows.append({**metadata, "prediction": prediction, **scored})
     reduce(totals)
-    gathered = [None] * world
-    if dist.is_initialized():
-        dist.all_gather_object(gathered, local_rows)
-    else:
-        gathered = [local_rows]
+    gathered = all_gather_objects(
+        local_rows, label=f"eval:{stage_name}:{dataset.task}:predictions", world=world)
     if rank == 0:
         rows = sorted((row for part in gathered for row in part), key=lambda row: row["id"])
         write_jsonl(Path(args.output) / "predictions" / stage_name / f"{dataset.task}.jsonl", rows)
@@ -549,8 +582,17 @@ def main(argv: list[str] | None = None) -> None:
     device = torch.device("cuda", local_rank)
     if not torch.cuda.is_bf16_supported():
         raise RuntimeError("A BF16-capable GPU is required")
-    if world > 1:
-        dist.init_process_group("nccl", timeout=timedelta(minutes=90))
+    initialize_distributed(world)
+    peft_version = None
+    if args.method == "lora":
+        try:
+            peft_version = metadata.version("peft")
+        except metadata.PackageNotFoundError as error:
+            raise RuntimeError(
+                "method=lora requires peft==0.18.1; run scripts/qwen/setup.sh") from error
+        if peft_version != "0.18.1":
+            raise RuntimeError(
+                f"method=lora requires peft==0.18.1, found {peft_version!r}")
     random.seed(args.seed + rank)
     np.random.seed(args.seed + rank)
     torch.manual_seed(args.seed + rank)
@@ -606,7 +648,14 @@ def main(argv: list[str] | None = None) -> None:
                    {"arguments": vars(args), "signature": signature, "git_commit": commit,
                     "python": platform.python_version(), "torch": torch.__version__,
                     "transformers": transformers.__version__, "cuda": torch.version.cuda,
+                    "peft": peft_version,
                     "gpu": [torch.cuda.get_device_name(index) for index in range(torch.cuda.device_count())],
+                    "distributed_collectives": {
+                        "tensor": "nccl" if world > 1 else None,
+                        "python_object": "gloo" if world > 1 else None,
+                        "object_timeout_seconds": (
+                            int(OBJECT_COLLECTIVE_TIMEOUT.total_seconds()) if world > 1 else None),
+                    },
                     "protocol": "CoIN task accuracy; no raw-example replay; no base weights saved"})
     with stage(args, "model_loading", -1, device, rank, world):
         model = load_model(

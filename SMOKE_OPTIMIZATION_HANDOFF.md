@@ -2,9 +2,9 @@
 
 > 唯一权威诊断文档。本文取代原 `DIAGNOSIS.md`、`DIAGNOSIS_DDP.md`、
 > `QWEN_PERFORMANCE.md` 和 `QWEN3_5_9B_CODE_AND_ACCURACY_ANALYSIS.md`。
-> 最后更新：2026-10-15（Asia/Shanghai）。代码基线：GitHub `v2` 的
-> `c9bf76c98d445fd61214b11856bf45067a65479a`；本文所述新增改动已提交为
-> `4b0f436312bbd87e8bd44bb39ce09240c0fc3665`，服务器验证即在该提交上进行（§8）。
+> 最后更新：2026-10-16（Asia/Shanghai）。本轮维护者裁定与实现基于 GitHub `v2`
+> `1371f14ebc04f0d4c4671da90c7a1ad7386f58c7`；服务器下一步只执行 §12.8，不再从早期章节
+> 自行挑选实验。历史提交与各轮服务器验证 SHA 保留在对应章节。
 
 ## 1. 当前结论
 
@@ -44,6 +44,11 @@
     72.76s 内处理 200 条。D 的单 rank 墙钟虽为 `1.24×T1`，但有用样本吞吐是
     **2.749 vs 1.710 sample/s，即 1.608× 单卡**。因此“D 比 A 慢”是口径错误；不过 A 的
     有效全局 batch=8、D=16，尚不能把 1.608× 当成同训练协议下的正式加速比。
+13. （2026-10-15，§12.6）P2 的 8 个任务训练与 full-route 标定均完成，训练输入等待最多
+    0.53%，加权 route 吞吐 21.29 sample/s；但第 36 个评测 cell 的对象汇总挂死，故 P2 **尚未
+    完成**，17.1–17.7h 仍是临时 ETA。
+14. （2026-10-15，§12.7）LoRA 在 GC 开启、batch=4、global batch=16 时双卡比单卡快
+    1.782×，P3 通过；同配置关闭 GC 会 OOM，因此正式 LoRA 必须保留默认 GC。
 
 ### 1.2 推断
 
@@ -88,6 +93,8 @@
 - **新**：D 阶段暴露的“rank 间宽度顺序不一致导致的锁步等待”在正式训练（shuffle=True、
   workers=4、8 任务更多宽度）下的量级未测（§8.7）。
 - **新**：评测生成的 `</think>` 前缀（§8.5 观察）。
+- **新**：独立 Gloo 对象通信是否能让 P2 从 task7 checkpoint 完成 OCRVQA、8 个末轮评测、
+  checkpoint 与 `run_complete`；这是 §12.8 的唯一下一项服务器验证。
 
 ## 2. 本轮实现
 
@@ -102,6 +109,7 @@
 | 2026-10-15 | 基于 `5ed8a62` 的本次 smoke-speed 提交 | `qwen_smope/{data,filtering,prepare_data,train,model,diagnose_ddp}.py`, `tests_qwen/test_qwen.py`, 本文与 `QWEN_SERVER.md` | 缺图分级与重试、分片过滤缓存、批量评测、确定性有限 route scan、checkpointing 对照开关及服务器逐步判据 | 34/34 单测、compileall、diff check | H100 上 T/E/R/C 各阶段均待验证；提交后在下一条记录补充精确 SHA |
 | 2026-10-15 | 实现提交 `83ef103` | 上述 9 个文件 | 将本轮实现、测试与 DeepSeek 执行单固化为可追溯提交 | 34/34 单测、compileall、diff check | 本条仅回填 SHA；H100 结论仍全部待验证 |
 | 2026-10-15 | 实现提交 `8df9249` | `qwen_smope/compare_ddp.py`, `qwen_smope/train.py`, `tests_qwen/test_qwen.py`, 本文与 `QWEN_SERVER.md` | 修正 DDP 墙钟/吞吐口径；增加协议匹配 E/F 自动审计；epoch 增加 input wait 与宽度分布 | 36/36 单测、compileall、diff check | E/F 与生产 8000 条单/双卡对照待独占 H100 |
+| 2026-10-16 | 基于 `1371f14` 的对象通信修复 | `qwen_smope/train.py`, `scripts/qwen/setup.sh`, `tests_qwen/test_qwen.py`, 本文与 `QWEN_SERVER.md` | NCCL 仅承载张量；Python 对象集合改走10分钟超时的独立 Gloo 组并校验语义标签；LoRA 正式命令保留 GC；setup/运行入口校验 peft | 38/38 单测、compileall、diff check 通过；本机 Windows 沙箱无可用 Bash，未重复执行 `bash -n` | 必须用 §12.8 的 P2 resume 在双 H100 验证，未回传前不声称死锁已修复 |
 
 本地验证环境没有可容纳 9B 模型的 GPU，也没有服务器 CoIN 数据，所以没有伪造 smoke/DDP
 完成结果。已执行：
@@ -130,6 +138,9 @@ python -m unittest discover -s tests_qwen -p 'test_*.py' -v
   原数据的有偏前缀。routing JSON 记录数量、seed 和
   source-index SHA256。
 - gradient checkpointing 默认开启；`--no-gradient-checkpointing` 仅用于 H100 显存/吞吐对照。
+- 双卡时 loss/计数等张量 collective 继续使用 NCCL；预测行、宽度字典和显存记录等 Python
+  对象使用独立 Gloo 进程组，超时10分钟，并携带调用点标签检查 rank 间顺序。该变更不改变样本、
+  更新、loss、路由或评测语义。
 - 图像默认 HTTP，长度桶默认 128；未升级 torch/Triton/FLA，也未启用 DDP bucket、
   static graph 或 autotune monkey-patch。
 
@@ -174,7 +185,9 @@ python -m qwen_smope.prepare_data \
 ## 4. 服务器前提与执行纪律
 
 目标环境为 2×H100 80GB。历史环境记录为 torch 2.5.1+cu121、transformers 5.3.0、
-triton 3.1.0、FLA 0.3.1、48 CPU 核；执行前要把实际版本写入产物，不能假设未变化。
+triton 3.1.0、FLA 0.3.1、48 CPU 核；执行前要把实际版本写入产物，不能假设未变化。LoRA
+还必须确认 `peft==0.18.1`；`scripts/qwen/setup.sh` 现在会导入并打印该版本，缺包必须按完整
+`requirements-qwen.txt` 修复，不能把失败环境当成方法失败。
 
 预期布局：
 
@@ -1051,7 +1064,7 @@ OUTPUT_ROOT=outputs/coin-qwen3.5-9b/verify-20261015b/prod-single-gbs16 \
 bash scripts/qwen/run.sh smope smoke \
   --tasks GQA --max-train-samples 8000 \
   --batch-size 4 --global-batch-size 16 \
-  --no-gradient-checkpointing --workers 4 \
+  --workers 4 \
   --eval-batch-size 1 --max-eval-samples 4 \
   --routing-scan-samples 1 --routing-scan-batch-size 1
 ```
@@ -1062,7 +1075,7 @@ OUTPUT_ROOT=outputs/coin-qwen3.5-9b/verify-20261015b/prod-ddp-gbs16 \
 bash scripts/qwen/run.sh smope smoke \
   --tasks GQA --max-train-samples 8000 \
   --batch-size 4 --global-batch-size 16 \
-  --no-gradient-checkpointing --workers 4 \
+  --workers 4 \
   --eval-batch-size 1 --max-eval-samples 4 \
   --routing-scan-samples 1 --routing-scan-batch-size 1
 ```
@@ -1243,7 +1256,7 @@ OUTPUT_ROOT=outputs/coin-qwen3.5-9b/verify-20261015c/lora-single-gbs16 \
 bash scripts/qwen/run.sh lora smoke \
   --tasks GQA --max-train-samples 8000 \
   --batch-size 4 --global-batch-size 16 \
-  --no-gradient-checkpointing --workers 4 \
+  --workers 4 \
   --eval-batch-size 1 --max-eval-samples 4
 ```
 
@@ -1253,13 +1266,14 @@ OUTPUT_ROOT=outputs/coin-qwen3.5-9b/verify-20261015c/lora-ddp-gbs16 \
 bash scripts/qwen/run.sh lora smoke \
   --tasks GQA --max-train-samples 8000 \
   --batch-size 4 --global-batch-size 16 \
-  --no-gradient-checkpointing --workers 4 \
+  --workers 4 \
   --eval-batch-size 1 --max-eval-samples 4
 ```
 
 两边必须为8000条、500次 update、global batch16、loss有限且 checkpoint 可加载。双卡
 `train_lora.seconds` 加速 `>=1.5×` 才给 LoRA 正式 run 使用双卡；否则 LoRA 保持单卡，并与其他
-单卡作业并行排程。禁止继续用 SMoPE sparse 时间代理 LoRA ETA。
+单卡作业并行排程。禁止继续用 SMoPE sparse 时间代理 LoRA ETA。上面的命令以 §12.7 实测为准，
+已经删除会导致约75.6 GiB 占用并 OOM 的 `--no-gradient-checkpointing`。
 
 ### 12.4 正式命令（只有对应门禁通过后才能执行）
 
@@ -1304,6 +1318,8 @@ bash scripts/qwen/run.sh zero_shot full \
 LoRA（仅当 §12.3 双卡门禁通过；先 seed-0，完成后分别改为1/2）：
 
 ```bash
+python -c "import peft; assert peft.__version__ == '0.18.1'; print('peft', peft.__version__)"
+
 CUDA_VISIBLE_DEVICES=0,1 \
 NPROC_PER_NODE=2 \
 SEEDS=0 \
@@ -1312,7 +1328,7 @@ bash scripts/qwen/run.sh lora full \
   --tasks ScienceQA,TextVQA,ImageNet,GQA,VizWiz,Grounding,VQAv2,OCRVQA \
   --max-train-samples 0 \
   --batch-size 4 --global-batch-size 16 \
-  --no-gradient-checkpointing --workers 4 \
+  --workers 4 \
   --eval-batch-size 1 --max-eval-samples 1000 --eval-sample-seed 42
 ```
 
@@ -1393,11 +1409,11 @@ ScienceQA dense：330.40s（0.0413 s/样本）。9 个 epoch（1 dense + 8 spars
 完全同构）。`init_process_group("nccl", timeout=90min)`：默认 async error handling 下，
 不手动终止也会在 ~90 分钟处由看门狗中止，但不会自愈。
 
-### 12.6.3 对正式 run 的影响与下一分支（交维护者决定）
+### 12.6.3 对正式 run 的影响与下一分支（已由 §12.8 裁定）
 
-- 观测到的挂死率：本轮 36 个 DDP 评测 cell 中 1 个（另有 P1 的 1 个 cell 正常），
-  即 ~1/37 ≈ 2.7%/cell。36 个 cell 的正式 run 至少挂一次的概率很高（~60%+），
-  且正式 run 的挂死会浪费已跑时间并需要人工 `--resume`。**因此 P2 虽未通过，
+- 观测事实仅为 37 个已尝试 DDP 评测 cell 中挂死 1 次；`1/37` 不是可靠的真实挂死概率，
+  把单次观测按独立同分布外推成“36 cell 至少一次约60%”没有统计依据，不能写进论文。
+  但一次可复现路径上的无限挂起已经足以构成正式 run 的工程阻断。**因此 P2 虽未通过，
   但不能把它当作偶然；在挂死被修复/缓解前不启动正式 seed-0。**
 - 可选缓解（维护者裁定，服务器不擅自改协议/代码）：
   1. **对象汇总改用 gloo 进程组**（`all_gather_object(..., group=gloo_pg)`，gloo 原生支持
@@ -1427,11 +1443,11 @@ ScienceQA dense：330.40s（0.0413 s/样本）。9 个 epoch（1 dense + 8 spars
    71.91 GiB allocated by PyTorch`（容量 79.18 GiB）。原因是机制性差异：SMoPE 的可训练
    参数只在 8 个 full-attention 层的专家/路由器，反向不需要冻结层激活；LoRA 在全部
    transformer 块的线性层上都有适配器，反向需要保存每一处适配层的输入激活。**SMoPE 的
-   no-GC 结论不能类推到 LoRA**——§12.3 与 §12.4 的 LoRA 命令按现文本无法运行。
+   no-GC 结论不能类推到 LoRA**——§12.3 与 §12.4 的 LoRA 命令按当时文本无法运行。
    失败目录保留为 `lora-single-gbs16.failed-noGC-oom/`。
    **本轮处置**：LoRA 门禁改用唯一可运行配置（**gradient checkpointing 保持默认开启**，
-   其余参数与 §12.3 逐字一致），单/双卡同配置对比；是否把该修正回写 §12.4 的 LoRA 正式
-   命令由维护者确认（候选：去掉 `--no-gradient-checkpointing`，或改物理 batch）。
+   其余参数与 §12.3 逐字一致），单/双卡同配置对比；维护者已在 §12.8 确认正式 LoRA 删除
+   `--no-gradient-checkpointing`，不通过降低物理 batch 保留 no-GC。
 
 ### 12.7.2 P3 结果（GQA 8000、gbs 16、GC 开启、workers 4）
 
@@ -1454,3 +1470,77 @@ LoRA 的 ETA 不得再用 SMoPE 时间代理（本轮有了 LoRA 实测：0.287 
 异质性未测（§12.6.1 的分布是 SMoPE 的）。正式 LoRA full 的 ETA 若需要按任务加权，
 应先用 LoRA 版的小规模校准，不能用 SMoPE 分布外推——但 LoRA 无 dense 阶段，且本条的
 0.287/0.161 s/样本已可用于粗估。
+
+## 12.8 维护者裁定与唯一下一步（2026-10-16）
+
+### 12.8.1 裁定
+
+1. **死锁方案采用“独立 Gloo 对象组 + 标签校验”，不原样重跑 P2。**默认 NCCL 组继续处理
+   loss、计数、route frequency 等 GPU 张量；所有 `all_gather_object`（评测 rows、stage 显存、
+   epoch 宽度分布）统一改走 CPU/Gloo，避免 `_object_to_tensor(...).to(cuda)`。每次对象集合带
+   语义标签，rank 顺序不一致会显式报错；Gloo 组超时10分钟，避免继续等待90分钟。此项属于通信
+   工程修复，不改变数据、训练或指标协议。现场只能证明旧 NCCL/CUDA 对象路径挂住，不能声称
+   已唯一定位 PyTorch/NCCL 的内部根因；H100 resume 通过前统一表述为“待验证修复”。
+2. **P2 不从头重跑。**保留原目录，从 task7 边界 checkpoint 用原参数加 `--resume`。这会按正确
+   协议重做 OCRVQA 的训练/route/末轮8个评测 cell，然后写 task8 checkpoint 与 `run_complete`；
+   既验证修复，也避免浪费已完成的前7任务。ETA 汇总只选首次成功的任务1–7 stage 与 resume
+   成功的任务8 stage，不能把失败尝试和 resume 的 OCRVQA 重复相加。
+3. **LoRA 正式配置确定为双卡、batch=4、global batch=16、GC 开启。**P3 已在这一配置上得到
+   1.782×，而 no-GC 已机制性 OOM；降低 batch 来保留 no-GC 没有实测收益，还会引入新变量，
+   因而不采用。§12.3/§12.4 已删除 LoRA 的 `--no-gradient-checkpointing`。SMoPE 仍使用已经通过
+   显存与吞吐门禁的 no-GC，二者的 GC 设置不同属于实现内存策略，不改变有效 global batch。
+
+### 12.8.2 服务器执行单：只做 P2 resume
+
+先更新并核验环境；必须看到当前 Git SHA、`peft 0.18.1`、两张空闲 H100，以及 checkpoint 的
+`next_task=7`。若 checkpoint 不是7或 matrix 不是7行，停止并回传，不猜测继续点。
+
+```bash
+cd /mnt/zq/SMOPE
+git pull --ff-only origin v2
+git rev-parse HEAD
+source .venv2/bin/activate
+python -c "import peft, torch; print('peft', peft.__version__); p=torch.load('outputs/coin-qwen3.5-9b/verify-20261015c/eta-8x8000/smope/full/seed-0/latest_adapter.pt', map_location='cpu', weights_only=False); print('next_task', p['next_task'], 'matrix_rows', len(p['matrix']))"
+nvidia-smi
+```
+
+确认输出为 `peft 0.18.1`、`next_task 7`、`matrix_rows 7` 后，执行与 §12.2 相同的命令，仅追加
+`--resume`；不要新建输出目录，不要删除旧 events/predictions：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+NPROC_PER_NODE=2 \
+SEEDS=0 \
+OUTPUT_ROOT=outputs/coin-qwen3.5-9b/verify-20261015c/eta-8x8000 \
+bash scripts/qwen/run.sh smope full \
+  --tasks ScienceQA,TextVQA,ImageNet,GQA,VizWiz,Grounding,VQAv2,OCRVQA \
+  --max-train-samples 8000 \
+  --batch-size 4 --global-batch-size 16 \
+  --no-gradient-checkpointing --workers 4 \
+  --routing-scan-samples 8000 --routing-scan-batch-size 1 \
+  --eval-batch-size 1 --max-eval-samples 200 --eval-sample-seed 42 \
+  --resume 2>&1 | tee outputs/coin-qwen3.5-9b/verify-20261015c/p2-gloo-resume.log
+```
+
+### 12.8.3 通过判据与后续分支
+
+P2 resume 必须同时满足：
+
+1. `resume_environment.json` 记录 `python_object=gloo`、10分钟超时和本次 Git SHA；日志无
+   collective order mismatch、Gloo/NCCL timeout、OOM、非有限 loss/gradient。
+2. resume 的 OCRVQA epoch 仍为8000样本、500 updates、global batch16，训练/route/8个评测
+   cell 全部结束；末尾新增且仅以最后一条 `run_complete` 作为完成证据。
+3. `latest_adapter.pt` 为 `next_task=8`、matrix 8行；`after_08_OCRVQA/` 有8个非空 prediction
+   JSONL，整个持续评测矩阵仍为36个 cell，checkpoint 能用相同命令再次 `--resume` 秒级收尾。
+4. 重新按 §12.2 公式计算五个 ETA 分量：任务1–7使用首次成功 stage，任务8只使用本次 resume
+   成功 stage；完整36-cell 的 `T_full_upper <=23h`，加权 route仍 `>=18 sample/s`。回传计算脚本、
+   所选 event 行及结果，不能只报最终数字。
+
+四项全过：将 P2 标为完成，**直接启动 §12.4 的 SMoPE exact-full-route seed-0**；不再插入新的
+SMoPE 吞吐代理或 LoRA 标定。seed-0 完成且 summary、36-cell predictions、routing、checkpoint
+齐全后，再跑 seed-1/2。LoRA 的 P3 已通过，轮到 LoRA 时直接用 §12.4 的 GC-on 双卡正式命令。
+
+若失败则按证据分支：标签不一致说明 rank 控制流确实分叉，回传两 rank 完整 traceback 后再定位；
+Gloo 超时但无标签结果说明某 rank 未进入对象集合，保留日志并停止正式 run；若仅 ETA >23h，才按
+§12.2 的评测边界分支处理。任何失败都不得原样无限重试，也不得用 `TORCH_DISTRIBUTED_DEBUG=DETAIL`
+所得时间做性能比较。

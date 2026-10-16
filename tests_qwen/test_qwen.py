@@ -1,4 +1,5 @@
 import json
+from datetime import timedelta
 from io import BytesIO
 from pathlib import Path
 import pickle
@@ -11,6 +12,7 @@ from PIL import Image
 import torch
 from torch.nn import functional as F
 
+import qwen_smope.train as train_module
 from qwen_smope.data import (CoINCollator, CoINDataset, CoINEvalCollator, CoINSample, ExactShard,
                              ImageFetcher, ImageUnavailableError, check_model,
                              subsample_records)
@@ -24,8 +26,8 @@ from qwen_smope.model import Experts, QwenCoINModel
 from qwen_smope.prepare_data import arguments as prepare_arguments
 from qwen_smope.report import continual_metrics, write_matrix
 from qwen_smope.scoring import box_iou, normalize_answer, normalize_vqa_answer, score_prediction
-from qwen_smope.train import (arguments, eval_dataset, record_dataset, routing_scan_indices,
-                              save_checkpoint, train_dataset, train_epoch)
+from qwen_smope.train import (all_gather_objects, arguments, eval_dataset, record_dataset,
+                              routing_scan_indices, save_checkpoint, train_dataset, train_epoch)
 
 
 class FakeProcessor:
@@ -748,6 +750,40 @@ class ExpertTests(unittest.TestCase):
 
 
 class ScoringReportTests(unittest.TestCase):
+    def test_distributed_initialization_adds_a_gloo_object_group(self):
+        group = object()
+        with patch.object(train_module, "_OBJECT_COLLECTIVE_GROUP", None), \
+                patch.object(train_module.dist, "is_gloo_available", return_value=True), \
+                patch.object(train_module.dist, "init_process_group") as initialize, \
+                patch.object(train_module.dist, "new_group", return_value=group) as new_group:
+            self.assertIs(train_module.initialize_distributed(2), group)
+        initialize.assert_called_once_with("nccl", timeout=timedelta(minutes=90))
+        new_group.assert_called_once_with(
+            backend="gloo", timeout=train_module.OBJECT_COLLECTIVE_TIMEOUT)
+
+    def test_object_collective_uses_gloo_group_and_validates_label(self):
+        group = object()
+
+        def matching(output, envelope, group=None):
+            self.assertIs(group, train_module._OBJECT_COLLECTIVE_GROUP)
+            output[:] = [envelope, {"label": envelope["label"], "payload": "rank-1"}]
+
+        with patch.object(train_module, "_OBJECT_COLLECTIVE_GROUP", group), \
+                patch.object(train_module.dist, "is_initialized", return_value=True), \
+                patch.object(train_module.dist, "all_gather_object", side_effect=matching):
+            self.assertEqual(
+                all_gather_objects("rank-0", label="eval:8:OCRVQA", world=2),
+                ["rank-0", "rank-1"])
+
+        def mismatched(output, envelope, group=None):
+            output[:] = [envelope, {"label": "stage:8:memory", "payload": "rank-1"}]
+
+        with patch.object(train_module, "_OBJECT_COLLECTIVE_GROUP", group), \
+                patch.object(train_module.dist, "is_initialized", return_value=True), \
+                patch.object(train_module.dist, "all_gather_object", side_effect=mismatched):
+            with self.assertRaisesRegex(RuntimeError, "order mismatch"):
+                all_gather_objects("rank-0", label="eval:8:OCRVQA", world=2)
+
     def test_train_epoch_reports_input_wait_and_sequence_widths(self):
         class TinyNetwork(torch.nn.Module):
             def __init__(self):

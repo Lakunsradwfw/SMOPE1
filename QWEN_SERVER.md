@@ -1,9 +1,9 @@
 # Qwen3.5-9B + CoIN 实验说明
 
 smoke 性能、超长样本过滤、DDP 诊断的唯一当前结论与服务器执行顺序见
-[`SMOKE_OPTIMIZATION_HANDOFF.md`](SMOKE_OPTIMIZATION_HANDOFF.md)。P0/P1/P3 已通过；P2 因最后
-一个评测对象集合挂起而未完成。服务器当前只执行交接文档 **§12.8 的 Gloo 修复后 resume**，
-通过前不启动正式 seed-0。
+[`SMOKE_OPTIMIZATION_HANDOFF.md`](SMOKE_OPTIMIZATION_HANDOFF.md)。P0/P1/P3 已通过，Gloo
+修复也已验证；P2 当前只被 OCRVQA 镜像缺少7个官方图像阻断。服务器只执行交接文档
+**§12.10 的同源图像恢复与 P2 resume**，通过前不启动正式 seed-0。
 
 本入口在 CoIN 八任务上运行三种可比较配置，全部从 post-trained 多模态
 `Qwen/Qwen3.5-9B` 开始，不再支持旧的 Base+CIFAR/CUB/ImageNet-R 分类实验。
@@ -87,7 +87,7 @@ SEEDS="0 1 2" bash scripts/qwen/run.sh smope full
 ```
 
 `scripts/qwen/run.sh` 默认 `NPROC_PER_NODE=1`；这个安全默认不变。P0/P1/P3 已授权交接文档
-§12.4 的正式命令显式设置 `NPROC_PER_NODE=2`，但必须先完成 §12.8 的 P2 resume 门禁。
+§12.4 的正式命令显式设置 `NPROC_PER_NODE=2`，但必须先完成 §12.10 的数据恢复与 P2 resume 门禁。
 
 默认任务顺序为论文随机顺序：
 
@@ -123,11 +123,11 @@ HTTP 图片通道和 `--length-bucket=128`。SMoPE 路由统计默认使用
 ## 2026-10-16：服务器唯一下一步
 
 不要从下面的历史标定章节继续挑实验。先拉取 `v2` 最新提交，然后严格执行
-[`SMOKE_OPTIMIZATION_HANDOFF.md` §12.8](SMOKE_OPTIMIZATION_HANDOFF.md)：检查 task7 checkpoint，
-用原 P2 命令追加 `--resume`，验证独立 Gloo 对象组完成 OCRVQA 与末轮8个评测 cell。四项判据
-全部通过后直接启动 §12.4 的 SMoPE exact-full-route seed-0。LoRA 正式配置已经裁定为双卡、
-batch4、global batch16、**保留默认 gradient checkpointing**；不得再加
-`--no-gradient-checkpointing`。
+[`SMOKE_OPTIMIZATION_HANDOFF.md` §12.10](SMOKE_OPTIMIZATION_HANDOFF.md)：从 OCR-VQA 官方发布
+或其 `dataset.json.imageURL` 的同源文件恢复全部7张图，生成 SHA256 审计 manifest，确认 HTTP
+和正式 N=1000 子集均为0缺图，再用原 P2 命令追加 `--resume`。禁止用相似封面、重新编码图或
+运行时跳过样本。P2 四项判据全过后直接启动 §12.4 的 SMoPE exact-full-route seed-0。LoRA
+正式配置仍为双卡、batch4、global batch16、默认 gradient checkpointing。
 
 ## 2026-10-15：24 小时目标的历史执行入口
 
@@ -159,7 +159,7 @@ bash scripts/qwen/run.sh smope smoke --max-length 512 --max-visual-tokens 128
 ### 历史 DDP 门禁（已完成；不要重跑）
 
 P0 E/F 与 P1-DDP 已通过，结果和原始路径见交接文档 §11。当时的下一步是交接文档 §12.2
-八任务各8000条 ETA 标定；该轮现已执行并在最后一个评测 cell 挂起，后续改由 §12.8 接管。
+八任务各8000条 ETA 标定；该轮现已执行并在最后一个评测 cell 暴露缺图，后续改由 §12.10 接管。
 下面命令仅保留作历史审计，不再是当前执行单。
 
 旧 DDP 汇总的 `D=1.24×T1` 是单 rank 墙钟，不是有用吞吐。A 单卡处理100条/58.49s，D 双卡

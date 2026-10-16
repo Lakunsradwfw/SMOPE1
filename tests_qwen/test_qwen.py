@@ -27,7 +27,8 @@ from qwen_smope.prepare_data import arguments as prepare_arguments
 from qwen_smope.report import continual_metrics, write_matrix
 from qwen_smope.scoring import box_iou, normalize_answer, normalize_vqa_answer, score_prediction
 from qwen_smope.train import (all_gather_objects, arguments, eval_dataset, record_dataset,
-                              routing_scan_indices, save_checkpoint, train_dataset, train_epoch)
+                              routing_scan_indices, save_checkpoint, stage, train_dataset,
+                              train_epoch)
 
 
 class FakeProcessor:
@@ -750,6 +751,19 @@ class ExpertTests(unittest.TestCase):
 
 
 class ScoringReportTests(unittest.TestCase):
+    def test_failed_stage_preserves_primary_error_without_epilogue_collectives(self):
+        args = SimpleNamespace(output="unused")
+        with patch.object(train_module, "sync"), \
+                patch.object(train_module.torch.cuda, "synchronize"), \
+                patch.object(train_module.torch.cuda, "reset_peak_memory_stats"), \
+                patch.object(train_module, "reduce") as reduce_mock, \
+                patch.object(train_module, "all_gather_objects") as gather_mock:
+            with self.assertRaisesRegex(ImageUnavailableError, "HTTP 404"):
+                with stage(args, "evaluate_OCRVQA", 7, torch.device("cpu"), 0, 2):
+                    raise ImageUnavailableError("OCR-VQA/images/missing.jpg", 404)
+        reduce_mock.assert_not_called()
+        gather_mock.assert_not_called()
+
     def test_distributed_initialization_adds_a_gloo_object_group(self):
         group = object()
         with patch.object(train_module, "_OBJECT_COLLECTIVE_GROUP", None), \

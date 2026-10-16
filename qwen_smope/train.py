@@ -356,17 +356,22 @@ def stage(args, name: str, task: int, device: torch.device, rank: int, world: in
     started = time.perf_counter()
     try:
         yield
-    finally:
-        torch.cuda.synchronize(device)
-        elapsed = torch.tensor(time.perf_counter() - started, dtype=torch.float64, device=device)
-        reduce(elapsed, dist.ReduceOp.MAX)
-        local = {"rank": rank, "allocated_gib": torch.cuda.max_memory_allocated(device) / 2**30,
-                 "reserved_gib": torch.cuda.max_memory_reserved(device) / 2**30}
-        memories = all_gather_objects(
-            local, label=f"stage:{task}:{name}:memory", world=world)
-        if rank == 0:
-            event(args.output, {"type": "stage", "stage": name, "task": task + 1,
-                                "seconds": float(elapsed), "memory": memories})
+    except BaseException:
+        # Do not start timing/memory collectives after one rank has already
+        # failed inside the stage.  The peers may still be in a different
+        # collective, so entering the normal epilogue here masks the primary
+        # exception with a collective-order mismatch (or used to hang on NCCL).
+        raise
+    torch.cuda.synchronize(device)
+    elapsed = torch.tensor(time.perf_counter() - started, dtype=torch.float64, device=device)
+    reduce(elapsed, dist.ReduceOp.MAX)
+    local = {"rank": rank, "allocated_gib": torch.cuda.max_memory_allocated(device) / 2**30,
+             "reserved_gib": torch.cuda.max_memory_reserved(device) / 2**30}
+    memories = all_gather_objects(
+        local, label=f"stage:{task}:{name}:memory", world=world)
+    if rank == 0:
+        event(args.output, {"type": "stage", "stage": name, "task": task + 1,
+                            "seconds": float(elapsed), "memory": memories})
 
 
 def train_epoch(network, model, loader, sampler, optimizer, scheduler, args,

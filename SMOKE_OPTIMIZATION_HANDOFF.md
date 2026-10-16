@@ -3,7 +3,7 @@
 > 唯一权威诊断文档。本文取代原 `DIAGNOSIS.md`、`DIAGNOSIS_DDP.md`、
 > `QWEN_PERFORMANCE.md` 和 `QWEN3_5_9B_CODE_AND_ACCURACY_ANALYSIS.md`。
 > 最后更新：2026-10-16（Asia/Shanghai）。本轮维护者裁定与实现基于 GitHub `v2`
-> `1371f14ebc04f0d4c4671da90c7a1ad7386f58c7`；服务器下一步只执行 §12.8，不再从早期章节
+> `c159f978b9bdbe3bdbef51da3b3e83cc6d63208d`；服务器下一步只执行 §12.10，不再从早期章节
 > 自行挑选实验。历史提交与各轮服务器验证 SHA 保留在对应章节。
 
 ## 1. 当前结论
@@ -49,6 +49,9 @@
     完成**，17.1–17.7h 仍是临时 ETA。
 14. （2026-10-15，§12.7）LoRA 在 GC 开启、batch=4、global batch=16 时双卡比单卡快
     1.782×，P3 通过；同配置关闭 GC 会 OOM，因此正式 LoRA 必须保留默认 GC。
+15. （2026-10-16，§12.9）Gloo 对象组和标签校验已在双 H100 上生效；旧挂起的直接触发链是
+    OCRVQA 评测 HTTP 404 导致 rank0 异常、rank1 正常进入评测汇总，随后两个 rank 进入不同
+    collective。八任务评测普查仅 OCRVQA 缺7个图像文件/35条记录（0.035%）。
 
 ### 1.2 推断
 
@@ -89,12 +92,14 @@
   `cache_built: false`，秒级）。
 - 旧 profiler 与探针的原始日志未纳入仓库；论文引用数字前应在当前环境重新产出可归档日志。
   （本轮新产出的原始日志已归档在 `verify-20261014/` 下，但历史日志仍缺失。）
-- **新**：OCR-VQA 缺图（54 条）与扫描健壮性的处理策略待维护者决定（§8.4）。
+- ~~OCR-VQA 训练缺图（54 条）与扫描健壮性的处理策略。~~ **已解决（§8.3、§8.4）**：训练侧
+  确定性过滤并记录 manifest；评测侧新发现的7文件缺损按 §12.10 从官方同源数据补齐。
 - **新**：D 阶段暴露的“rank 间宽度顺序不一致导致的锁步等待”在正式训练（shuffle=True、
   workers=4、8 任务更多宽度）下的量级未测（§8.7）。
 - **新**：评测生成的 `</think>` 前缀（§8.5 观察）。
-- **新**：独立 Gloo 对象通信是否能让 P2 从 task7 checkpoint 完成 OCRVQA、8 个末轮评测、
-  checkpoint 与 `run_complete`；这是 §12.8 的唯一下一项服务器验证。
+- ~~独立 Gloo 对象通信能否把旧静默挂死变成可定位失败。~~ **已解决（§12.9）**：同一触发场景
+  20分钟内明确报出 rank 标签错配并保留两侧 traceback。当前待验证项是 §12.10 补齐7个官方
+  同源文件后，P2 能否写出 task8 checkpoint 与 `run_complete` 并得到完整 ETA。
 
 ## 2. 本轮实现
 
@@ -110,6 +115,7 @@
 | 2026-10-15 | 实现提交 `83ef103` | 上述 9 个文件 | 将本轮实现、测试与 DeepSeek 执行单固化为可追溯提交 | 34/34 单测、compileall、diff check | 本条仅回填 SHA；H100 结论仍全部待验证 |
 | 2026-10-15 | 实现提交 `8df9249` | `qwen_smope/compare_ddp.py`, `qwen_smope/train.py`, `tests_qwen/test_qwen.py`, 本文与 `QWEN_SERVER.md` | 修正 DDP 墙钟/吞吐口径；增加协议匹配 E/F 自动审计；epoch 增加 input wait 与宽度分布 | 36/36 单测、compileall、diff check | E/F 与生产 8000 条单/双卡对照待独占 H100 |
 | 2026-10-16 | 基于 `1371f14` 的对象通信修复 | `qwen_smope/train.py`, `scripts/qwen/setup.sh`, `tests_qwen/test_qwen.py`, 本文与 `QWEN_SERVER.md` | NCCL 仅承载张量；Python 对象集合改走10分钟超时的独立 Gloo 组并校验语义标签；LoRA 正式命令保留 GC；setup/运行入口校验 peft | 38/38 单测、compileall、diff check 通过；本机 Windows 沙箱无可用 Bash，未重复执行 `bash -n` | 必须用 §12.8 的 P2 resume 在双 H100 验证，未回传前不声称死锁已修复 |
+| 2026-10-16 | 基于 `c159f97` 的评测数据裁定与异常保真 | `qwen_smope/train.py`, `tests_qwen/test_qwen.py`, 本文、`QWEN_SERVER.md`, `SMOPEDATAS_CoIN_README.md` | 决定补齐7个官方同源 OCRVQA 图像而不改变评测集；失败 stage 不再进入跨 rank epilogue collective，保留首因 | 39/39 单测、compileall、diff check 通过 | 官方文件来源、SHA256 与双 H100 P2 resume 待服务器验证 |
 
 本地验证环境没有可容纳 9B 模型的 GPU，也没有服务器 CoIN 数据，所以没有伪造 smoke/DDP
 完成结果。已执行：
@@ -262,7 +268,8 @@ loss、样本计数和 checkpoint 行为一致，才可恢复为默认。
 ## 7. 测量教训
 
 - 固定 shape 且把 collate 排除在循环外的微基准不能代表真实变长训练。
-- `stage()` 在 `finally` 记录耗时；异常路径也会写事件。必须先确认阶段成功完成，再引用耗时。
+- `stage()` 只为成功完成的阶段记录跨 rank 耗时和显存；主体异常会立即保留并抛出首因，不再进入
+  collective，也不会写入可误用的失败阶段耗时。
 - 不得并发运行 GPU 探针后把资源竞争误判为模型性能。
 - 论文只引用当前代码、固定配置和可追溯原始产物产生的数字；历史摘要用于制定假说，不是最终证据。
 
@@ -1613,3 +1620,68 @@ DataLoader worker 3 取图得到 **HTTP 404（`OCR-VQA/images/1421539896.jpg`）
 2. 处理完成后，用与 §12.8.2 相同的命令 resume 即可继续（checkpoint 完好停在 task 7
    边界）；P2 四项判据全部通过后按 §12.8.3 启动正式 seed-0。
 3. 本轮未做（按纪律）：原样重试、改协议参数、动其他任务（其余 7 任务评测集无缺图）。
+
+## 12.10 维护者裁定：补齐7个官方评测图像，不改变评测集（2026-10-16）
+
+### 12.10.1 裁定与依据
+
+选择 §12.9.4(a)：**补齐 OCRVQA test 缺失的7个官方原始图像**；不采用评测侧确定性剔除。
+
+1. 这35条记录的标注与 image id 都存在，缺的是本地/WebDAV 镜像文件，因此属于数据镜像不完整，
+   不是基准定义中的无图样本。补齐同源文件恢复的是既定的99,926条 OCRVQA test，不改变论文指标
+   的总体；剔除则会把评测总体改成99,891条，并使固定 seed 的 N=1000 重新抽取替代样本。
+2. 评测 ID 必须在 zero-shot、LoRA、SMoPE、所有训练 seed 和36个持续学习 cell 间一致。运行时
+   捕获404并跳过会导致 rank 样本数/collective 次序不一致，明确禁止；“过滤后再采样”虽可做到
+   确定，但仍是一个新的评测协议，只作为官方同源文件无法取得时的备用方案。
+3. OCR-VQA 官方项目页仍提供数据下载入口；其官方 README 明确 `dataset.json` 以 image id 为键，
+   每项带原始 `imageURL`。因此恢复必须来自官方发布包，或本地
+   `cl_dataset/OCR-VQA/dataset.json` 对应项记录的同源 URL。不得用搜索到的相似封面、截图、
+   生成图、占位图或经过人工重新编码的版本替代。
+
+官方依据：<https://ocr-vqa.github.io/>（Dataset Download）与
+<https://ocr-vqa.github.io/kvqa_ProjectFiles/README.txt>（image id / imageURL 格式）。
+
+### 12.10.2 恢复范围与审计要求
+
+必须一次补齐全部7个文件，而不是只补当前 N=1000 命中的 `1421539896.jpg`：
+
+```text
+1285442962.jpg
+1421539896.jpg
+1558210571.jpg
+1609619919.jpg
+1931271070.jpg
+615754090.jpg
+857194321.jpg
+```
+
+先下载到独立 staging 目录，逐文件完成 JPEG 解码与 RGB 转换验证，再原子发布到 WebDAV 的
+`OCR-VQA/images/`。在 `verify-20261015c/eval-image-repair-manifest.json` 记录：`image_id`、目标
+相对路径、权威来源类型（`official_release` 或 `dataset_json_imageURL`）、完整来源 URL、下载 UTC、
+HTTP 状态、`size_bytes`、`sha256`、宽高、Pillow 解码结果。原始 `dataset.json`、test 指令 JSON
+及既有图片不得改写。若任一文件只有非官方来源、URL 内容无法解码、image id 对不上或需要人工
+重编码，停止并回传，不得自行切到剔除方案。
+
+恢复后必须满足以下门禁：
+
+1. 7个目标经训练使用的同一 HTTP base URL 全部返回200，下载字节的 SHA256 与 repair manifest
+   一致，Pillow `verify()` 和 RGB decode 均成功。
+2. 重跑 `eval-probes/OCRVQA-test.json` 的同一全量探针：99,926条记录、7个目标均存在、
+   `missing_records=0`、`missing_files=0`；其他7任务无需重扫。
+3. 重跑 `check_eval_subset_missing.py`：正式 N=1000/seed=42 八任务全部0缺图，样本 ID SHA/列表
+   除“原先已选但不可读的图现在可读”外不得变化；尤其不能从子集中移除 `1421539896_*`。
+4. 将 repair manifest、恢复命令/脚本、stdout/stderr、发布前后 HTTP probe 与准确 Git SHA 一并
+   归档；论文数据说明披露“OCRVQA 镜像缺7个官方文件，按原 image id 从官方同源数据恢复”，
+   这不是样本剔除，也不改变评测 N。
+
+### 12.10.3 P2 resume 与通过后的顺序
+
+上述四项门禁全过后，使用 §12.8.2 **完全相同命令**再次 `--resume`。checkpoint 仍应为
+`next_task=7`/matrix 7行；不要清理旧 events/predictions，也不要改变训练、route 或评测参数。
+本轮代码还使失败 stage 在主体异常时直接保留并抛出首因，不再进入计时/显存 collective；Gloo
+标签校验继续作为正常成功路径的顺序防线。
+
+P2 的 §12.8.3 四项判据全部通过后，直接启动 §12.4 的 SMoPE exact-full-route seed-0；不再新增
+吞吐标定。若官方同源7文件确实无法取得，停止并把可验证的失败 URL/官方包检查结果回传维护者，
+届时才实施“完整评测 split 先确定性过滤35条、再按固定 seed 抽 N=1000、写入 manifest”的备用
+代码路径，并要求三种方法和所有 seed 从同一过滤清单重新开始。

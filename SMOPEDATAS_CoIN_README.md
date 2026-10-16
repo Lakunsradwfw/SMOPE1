@@ -249,7 +249,7 @@ refcoco/refcoco/          refcoco_plus/refcoco+/     refcocog/refcocog/
 | 指令中图像为 `./cl_dataset/...` 相对路径 | ⚠️ 仍需注意 | 路径解析已改为显式基于 coin-root，不再依赖 cwd |
 | `refs(*).p` 是 pickle | ⚠️ 仍未用到 | Grounding 走 `Instructions_*` 的 JSON，未直接读 pickle |
 | 部分任务缺 `val.json`/`test.json` | ✅ 已处理 | 评估改用 `Instructions_Original`，见 §6 |
-| `OCR-VQA/_failed_urls.json` 非空 | ⚠️ 少量 | 缺图样本在 dataloader 里跳过 |
+| `OCR-VQA/_failed_urls.json` 非空 | ⚠️ 已确认镜像缺损 | 训练侧按 manifest 确定性过滤；评测侧不得运行时跳过。2026-10-16 普查确认 test 缺 7 个文件/35 条记录，按交接手册 §12.10 从官方同源数据补齐并记录校验和 |
 
 ---
 
@@ -291,7 +291,10 @@ refcoco/refcoco/          refcoco_plus/refcoco+/     refcocog/refcocog/
 `max_length` 扫描完整 split，确定性剔除无法保留完整答案的样本，再从有效样本序列取前 N 条。
 过滤缓存不以 N 为键，所以 smoke/full、所有方法和 seed 使用同一有效前缀。详细字段、剔除率门禁
 和服务器验证状态统一见 [`SMOKE_OPTIMIZATION_HANDOFF.md`](SMOKE_OPTIMIZATION_HANDOFF.md)。
-评测采样不应用训练过滤，仍保持上文固定种子的随机子集语义。
+评测采样不应用训练过滤，仍保持上文固定种子的随机子集语义。若镜像缺少官方评测图像，应补回
+同一 image id 的官方原始文件，而不是在 DataLoader 中动态跳过；动态跳过会让 DDP rank 样本数
+不一致，也会改变方法/seed 间的评测 ID。OCRVQA 的7文件修复流程与审计字段见
+[`SMOKE_OPTIMIZATION_HANDOFF.md` §12.10](SMOKE_OPTIMIZATION_HANDOFF.md)。
 
 > 注：曾评估过改用 `vantuan5644/CoIN-CL` 提供的固定种子子集
 > （`*_subset*_seed42.json`），但那是**第三方**为另一套训练代码制作的产物，其取舍规则

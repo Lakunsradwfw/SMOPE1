@@ -1395,11 +1395,16 @@ ScienceQA dense：330.40s（0.0413 s/样本）。9 个 epoch（1 dense + 8 spars
 
 - 两个 rank 的 GPU 均 100% 空转、进程 CPU ~96%、超过 40 分钟无任何新事件；RSS 稳定
   （3.66/3.70 GB）不增长。
-- **rank 0**（由 `after_08_OCRVQA/OCRVQA.jsonl` 缺失推定——写文件的 rank 未到达 write_jsonl）：
-  卡在 `evaluate_task` 的 `all_gather_object` **前置序列化**内：`_object_to_tensor` →
-  `torch.ByteTensor(...).to(device)` → `cudaStreamSynchronize` 永不返回。
-- **rank 1**：卡在 stage 退出处 `all_gather_object(memories, local)` 的**尺寸收集**：
+- **rank 1（pid 1557580）**：卡在 `evaluate_task` 的 `all_gather_object` **前置序列化**内：
+  `_object_to_tensor` → `torch.ByteTensor(...).to(device)` → `cudaStreamSynchronize` 永不返回。
+- **rank 0（pid 1557579）**：卡在 stage 退出处 `all_gather_object(memories, local)` 的**尺寸收集**：
   `int(object_size_list[i])` → `_local_scalar_dense_cuda` → `cudaStreamSynchronize` 永不返回。
+- **修正与触发事件（2026-10-16 经 §12.9 的标签校验错误证实）**：本节初稿曾按
+  `OCRVQA.jsonl` 缺失把两个 pid 的 rank 归属写反。实际是 rank 0 的 OCRVQA 评测分片
+  命中缺图 `OCR-VQA/images/1421539896.jpg`（HTTP 404）而**先崩溃**，随后进入 stage 退出
+  的内存集合；rank 1 正常完成循环、进入评测汇总集合。旧 NCCL 对象路径下两个不同集合
+  静默互等——这就是本次挂死的真正触发链，§12.9.2 在同一触发场景下立即得到
+  `Object collective order mismatch` 报错，两处证据一致。
 - 分类为**集合通信错配/挂死**（NCCL 内核层自旋、两个 rank 的调用序列不再对齐），
   不是数据/IO/算力问题。
 
@@ -1544,3 +1549,67 @@ SMoPE 吞吐代理或 LoRA 标定。seed-0 完成且 summary、36-cell predictio
 Gloo 超时但无标签结果说明某 rank 未进入对象集合，保留日志并停止正式 run；若仅 ETA >23h，才按
 §12.2 的评测边界分支处理。任何失败都不得原样无限重试，也不得用 `TORCH_DISTRIBUTED_DEBUG=DETAIL`
 所得时间做性能比较。
+
+## 12.9 服务器执行记录：P2 Gloo resume（2026-10-16，`75e1c3c`）——修复生效，暴露评测集缺图
+
+> 按 §12.8.2 逐字执行。**结论：Gloo+标签校验修复按设计工作（旧静默挂死 → 20 分钟内明确
+> 报错）；但 resume 被一个新确认的数据问题阻断：OCRVQA 评测集缺图，且正式 N=1000 子集
+> 恰好命中。P2 仍未完成，正式 seed-0 保持停止。**
+
+### 12.9.1 前置核验（§12.8.2 全项通过）
+
+HEAD=`75e1c3cfc85464a3451e0e4276561b33b7ad8c23`；`peft 0.18.1`；checkpoint
+`next_task=7`、`matrix_rows=7`；两卡 0MiB 空闲。
+
+### 12.9.2 resume 执行与结果
+
+与 §12.2 相同命令仅追加 `--resume`（原目录）。时间线（UTC）：04:09 启动 → OCRVQA
+`train_sparse:8=346.7s` → `route_scan` → 末轮 8 个评测 cell 中 7 个完成
+（ScienceQA 27.1 / TextVQA 32.8 / ImageNet 27.0 / GQA 25.6 / VizWiz 31.0 /
+Grounding 141.4 / VQAv2 26.2s，全部经 Gloo 对象组正常汇总并写出）→ OCRVQA cell 的
+DataLoader worker 3 取图得到 **HTTP 404（`OCR-VQA/images/1421539896.jpg`）**，eval 循环
+抛出 `ImageUnavailableError` → rank 0 进入 stage 退出内存集合，rank 1 已在评测汇总集合 →
+**`RuntimeError: Object collective order mismatch at 'stage:7:evaluate_OCRVQA:memory'`**
+（rank labels 列出两种不同标签）→ torchrun 以 exit 1 终止。总墙钟约 20 分钟。
+
+- **判据 1 通过**：`resume_environment.json` 记录 `git_commit=75e1c3c`、
+  `distributed_collectives={tensor: nccl, python_object: gloo, object_timeout_seconds: 600}`；
+  日志无 Gloo/NCCL timeout、OOM、非有限 loss/gradient。
+- **修复验证成功**：同一个曾静默挂死 40+ 分钟的触发场景，现在立即给出明确错误与两个
+  rank 的完整 traceback（`p2-gloo-resume.log`）；§12.6.2 的 rank 归属已按此证据修正。
+- 判据 2/3 不通过：OCRVQA cell 未完成 → 无 task8 checkpoint、无 run_complete；
+  `after_08_OCRVQA/` 仍 7 个文件（均为本次 resume 重写）。checkpoint 保持
+  `next_task=7`/7 行未动。
+- 失败分支（§12.8.3）：“标签不一致 → 回传两 rank 完整 traceback 后再定位”——已定位
+  （12.9.3），未做任何原样重试。
+
+### 12.9.3 定位：OCRVQA 评测集缺图（新阻断项）
+
+- curl 复核 `1421539896.jpg` → **404**；OCRVQA test 中 5 条记录（source_index 2467–2471，
+  `question_id` `1421539896_0.._4`）引用该图。
+- 八任务**评测 split** 缺图普查（12 并发 ≤14 上限，纯 HTTP；产物 `eval-probes/*.json`）：
+  ScienceQA test 2,017 张、TextVQA val 5,000、ImageNet test 5,050、GQA test 12,578、
+  VizWiz val 4,319、Grounding test 30,969、VQAv2 val 214,354 全部 **0 缺图**；
+  **OCRVQA test 99,926 张中 35 条记录缺图（0.035%）**——注意这 35 条只对应
+  **7 个不同的图片文件**（OCRVQA 每本书图 5 个问题：7×5=35），清单：
+  `1285442962 / 1421539896 / 1558210571 / 1609619919 / 1931271070 / 615754090 /
+  857194321`（.jpg）。若选数据修复，实际只需补回 7 个文件。
+- **正式子集交集**（`check_eval_subset_missing.py` → `eval-subset-missing.json`）：
+  正式 N=1000/seed=42 的 8 个评测子集中，**OCRVQA 含 1 张缺图**（即 1421539896.jpg
+  所在记录），其余 7 任务 0。→ **正式 seed-0 会在末轮 OCRVQA cell 确定性崩溃**
+  （新代码=快速报错，旧代码=沉默挂死）——这不是概率风险，是已知必现事件。
+- 既有的训练侧 54 条缺图剔除（§8.3.2）与本次评测侧 35 张缺图是同一镜像问题的两面；
+  评测侧此前从不需要缺图清单，故未建立。
+
+### 12.9.4 待维护者决策（正式 run 保持停止）
+
+1. **OCRVQA 评测缺图处理**（服务器不擅自选择）：
+   (a) 补齐镜像中 35 张缺图（数据修复最干净；正式子集强制需要 `1421539896.jpg`，
+   其他 N/seed 组合会命中其余）；
+   (b) **评测侧确定性剔除**：复用本目录 `eval-probes/OCRVQA-test.json` 的缺图清单，
+   对 eval split 做一次确定性缺图剔除并在 `dataset_manifest`/论文披露（需要改代码，
+   属维护者权限；注意评测集在所有方法/seed 间必须一致）；
+   (c) 其它方案。
+2. 处理完成后，用与 §12.8.2 相同的命令 resume 即可继续（checkpoint 完好停在 task 7
+   边界）；P2 四项判据全部通过后按 §12.8.3 启动正式 seed-0。
+3. 本轮未做（按纪律）：原样重试、改协议参数、动其他任务（其余 7 任务评测集无缺图）。

@@ -1329,3 +1329,128 @@ bash scripts/qwen/run.sh lora full \
 - P3 的单/双卡样本、update、loss、显存、阶段墙钟、加速比及 resume 结果。
 - 所有计划项先标“待验证”；只有原始产物齐全后才改为“已完成”。失败时保留目录，不覆盖、不删
   cache，并在本文写明失败点和下一分支。
+
+## 12.6 服务器执行记录：P2 首次执行（2026-10-15，`0a5643a`）——数据与死锁失败分支
+
+> 按 §12.2 逐字执行；两卡独占；产物在 `outputs/coin-qwen3.5-9b/verify-20261015c/`。
+> **P2 状态：未完成（8/8 任务训练+route 完成，35/36 评测 cell 完成；最后一个 OCRVQA
+> 评测 cell 期间 DDP 死锁，任务 8 的 checkpoint 与 run_complete 未产生）。**
+> 正式 seed-0 **不启动**：见 12.6.3 的悬置风险。
+
+### 12.6.1 逐任务实测（8×8000 标定，命令见 §12.2）
+
+| task | sparse_s | sparse s/样本 | route_s | route 条/s | input_wait | 最大宽度 | 峰值 GiB |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ScienceQA | 269.28 | 0.0337 | 331.32 | 24.15 | 0.13% | 640 | 37.78 |
+| TextVQA | 362.18 | 0.0453 | 384.37 | 20.81 | 0.41% | 768 | 42.06 |
+| ImageNet | 272.14 | 0.0340 | 372.96 | 21.45 | 0.53% | 384 | 29.44 |
+| GQA | 587.99 | 0.0735 | 389.28 | 20.55 | 0.20% | 1024 | 50.95 |
+| VizWiz | 313.53 | 0.0392 | 379.08 | 21.10 | 0.44% | 384 | 29.44 |
+| Grounding | 522.33 | 0.0653 | 377.74 | 21.18 | 0.17% | 1024 | 50.95 |
+| VQAv2 | 385.28 | 0.0482 | 374.83 | 21.34 | 0.27% | 1024 | 50.95 |
+| OCRVQA | 329.79 | 0.0412 | 373.12 | 21.44 | 0.34% | 512 | 33.55 |
+
+ScienceQA dense：330.40s（0.0413 s/样本）。9 个 epoch（1 dense + 8 sparse）全部满足
+`samples_with_ddp_padding=8000`、`optimizer_updates=500`、global batch 16，loss/grad 全部有限。
+
+**已完成部分的五判据**：
+
+1. 8 任务完成/样本/update/有限性：**全部通过**（除任务 8 的 checkpoint 未写出，见 12.6.2）。
+2. 峰值 allocated **50.95 GiB < 72**，全部宽度 **≤1024**：通过。
+3. `input_wait/train_sparse` 最大 **0.53% ≤ 10%**：通过。
+4. **加权 route 全局吞吐 = 570,260 / T_route = 21.29 条/s ≥ 18：通过**
+   （与驱动脚本单进程 ~10.5 条/s × 2 rank 分片一致，互验成立）。
+5. T_full_upper：**仅能给出临时值**（缺 1 个 eval cell 与完整 wall）：
+   T_sparse=7.422h、T_dense=0.146h、T_route=7.439h（加权公式）、
+   Σ35/36 eval cells=1310.6s；实测 T_fixed ≈ 74s（wall 2.15h − 各 stage 合计 2.13h）。
+   若缺失的 OCRVQA cell 估计为 200–600s，T_eval_upper=5×Σ≈2.10–2.65h，
+   **临时 T_full_upper ≈ 17.1–17.7h**（< 23h）。**这是临时值：cell 缺失 + wall 含死锁
+   悬挂时间被剔除，不能替代完整 P2。**
+
+### 12.6.2 失败点：DDP 评测汇总阶段的死锁（非慢任务）
+
+时间线（UTC）：15:33 拉取/前置检查 → 15:35 启动 → 17:42:41 写出第 7 个 eval cell
+（VQAv2.jsonl）→ 之后的 OCRVQA cell 期间死锁 → 18:14 首次 py-spy 取证 → 18:25 终止进程组
+（torchrun 父进程 SIGTERM）。**死锁前的 35/36 评测 cell 与全部训练/route 阶段均为同一代码
+路径，全部正常。**
+
+现场（证据存档 `verify-20261015c/hang-diagnostics/`：两份 `*-native.txt`、`nvidia-smi-at-hang.txt`、
+`events-at-hang.jsonl`、`p2-log-at-hang.txt`）：
+
+- 两个 rank 的 GPU 均 100% 空转、进程 CPU ~96%、超过 40 分钟无任何新事件；RSS 稳定
+  （3.66/3.70 GB）不增长。
+- **rank 0**（由 `after_08_OCRVQA/OCRVQA.jsonl` 缺失推定——写文件的 rank 未到达 write_jsonl）：
+  卡在 `evaluate_task` 的 `all_gather_object` **前置序列化**内：`_object_to_tensor` →
+  `torch.ByteTensor(...).to(device)` → `cudaStreamSynchronize` 永不返回。
+- **rank 1**：卡在 stage 退出处 `all_gather_object(memories, local)` 的**尺寸收集**：
+  `int(object_size_list[i])` → `_local_scalar_dense_cuda` → `cudaStreamSynchronize` 永不返回。
+- 分类为**集合通信错配/挂死**（NCCL 内核层自旋、两个 rank 的调用序列不再对齐），
+  不是数据/IO/算力问题。
+
+**已排除**：对象过大（用同一数据集复现 rank 分片的 rows，pickle 仅 8 KB）；内存泄漏
+（RSS 稳定）；图像服务器劣化（实测 5–21ms，且死锁发生在生成之后的汇总阶段）；显存 OOM
+（无当日 OOM/异常）；GPU 硬件错误（dmesg 无当日 Xid）；协议参数（与成功的 35 个 cell
+完全同构）。`init_process_group("nccl", timeout=90min)`：默认 async error handling 下，
+不手动终止也会在 ~90 分钟处由看门狗中止，但不会自愈。
+
+### 12.6.3 对正式 run 的影响与下一分支（交维护者决定）
+
+- 观测到的挂死率：本轮 36 个 DDP 评测 cell 中 1 个（另有 P1 的 1 个 cell 正常），
+  即 ~1/37 ≈ 2.7%/cell。36 个 cell 的正式 run 至少挂一次的概率很高（~60%+），
+  且正式 run 的挂死会浪费已跑时间并需要人工 `--resume`。**因此 P2 虽未通过，
+  但不能把它当作偶然；在挂死被修复/缓解前不启动正式 seed-0。**
+- 可选缓解（维护者裁定，服务器不擅自改协议/代码）：
+  1. **对象汇总改用 gloo 进程组**（`all_gather_object(..., group=gloo_pg)`，gloo 原生支持
+     对象，无 CUDA 张量中转；语义不变，改动小、属于工程修复）；
+  2. **fail-fast**：缩短 NCCL 看门狗超时 + 保留 async error handling，让挂死在 N 分钟内
+     报错并用完全相同命令 `--resume`（checkpoint 粒度为任务边界）；
+  3. **评测 cell 改单 rank 汇总**（`ExactShard` 拆数据、rank0 收集；语义不变、墙钟变慢）；
+  4. 不改代码直接重跑（消耗 3h，且风险未消除）。
+- 若决定先复核根因：下一次尝试建议加 `NCCL_DEBUG=WARN`（或 INFO）并让其自然触发看门狗，
+  保留错误消息后再杀——本轮人工终止早于 90 分钟超时，未取得看门狗文本。
+- 任务 8 的 checkpoint 未写出（`latest_adapter.pt` 停留在 17:25 的任务 7 边界）；
+  P1 已验证过 checkpoint/resume 机制本身。**目录保留，未覆盖，未删 cache。**
+
+## 12.7 服务器执行记录：P3 LoRA 双卡门禁（2026-10-15，`0a5643a`）——通过 + 两处环境修正
+
+> 按 §12.3 执行。**结论：LoRA 双卡 `train_lora` 加速 1.782× ≥ 1.5，P3 通过**；但执行中发现
+> 两处与文档不符的环境事实，均按纪律保留失败目录并记录偏差。
+
+### 12.7.1 两处修正（影响 §12.3/§12.4 的命令文本）
+
+1. **venv 缺 `peft`**：§12.3 首次执行在 `load_model` 处 `ModuleNotFoundError: No module
+   named 'peft'`（此前从未跑过 LoRA）。已按 `requirements-qwen.txt` 的 pin 安装
+   `peft==0.18.1`（`pip install --no-deps`，其余依赖已在位且版本符合 pin）；导入与
+   LoRA 模型构建验证通过。失败目录保留为 `lora-single-gbs16.failed-peft-missing/`。
+2. **LoRA + `--no-gradient-checkpointing` 在 batch 4 必然 OOM**：
+   `torch.OutOfMemoryError ... Tried to allocate 3.79 GiB. GPU 0 ... 75.63 GiB in use,
+   71.91 GiB allocated by PyTorch`（容量 79.18 GiB）。原因是机制性差异：SMoPE 的可训练
+   参数只在 8 个 full-attention 层的专家/路由器，反向不需要冻结层激活；LoRA 在全部
+   transformer 块的线性层上都有适配器，反向需要保存每一处适配层的输入激活。**SMoPE 的
+   no-GC 结论不能类推到 LoRA**——§12.3 与 §12.4 的 LoRA 命令按现文本无法运行。
+   失败目录保留为 `lora-single-gbs16.failed-noGC-oom/`。
+   **本轮处置**：LoRA 门禁改用唯一可运行配置（**gradient checkpointing 保持默认开启**，
+   其余参数与 §12.3 逐字一致），单/双卡同配置对比；是否把该修正回写 §12.4 的 LoRA 正式
+   命令由维护者确认（候选：去掉 `--no-gradient-checkpointing`，或改物理 batch）。
+
+### 12.7.2 P3 结果（GQA 8000、gbs 16、GC 开启、workers 4）
+
+| 指标 | 单卡 | 双卡 DDP | 判据 | 结果 |
+|---|---:|---:|---|---|
+| train_lora | 2294.22s | **1287.32s** | ≥1.5× | **1.782×，通过** |
+| epoch 样本 / updates | 8000 / 500 | 8000 / 500 | 一致 | 通过 |
+| loss | 0.1026 | 0.1028 | 有限、一致 | 通过 |
+| input_wait | 0.62s | 0.52s | — | 通过 |
+| 峰值 allocated | 30.73 GiB | 30.89 GiB | <72 GiB | 通过 |
+| evaluate_GQA（N=4） | 100.0% | 100.0% | — | 一致 |
+| checkpoint `--resume` | — | 通过（签名校验→`next_task=1`→收尾） | 可加载 | 通过 |
+
+**决策（按 §12.3 预设规则）**：LoRA 正式 run 可使用双卡（以 GC 开启为准）；
+LoRA 的 ETA 不得再用 SMoPE 时间代理（本轮有了 LoRA 实测：0.287 s/样本单卡、
+0.161 s/样本双卡全局）。原始产物：`verify-20261015c/lora-{single,ddp}-gbs16/`、对应
+`lora-{single,ddp}-run.log`、`lora-ddp-resume-check.log`、前后 nvidia-smi、两个失败目录。
+
+**注意**：该门禁只回答“LoRA 双卡是否 ≥1.5×”，样本为单任务 GQA 8000；LoRA 的八任务
+异质性未测（§12.6.1 的分布是 SMoPE 的）。正式 LoRA full 的 ETA 若需要按任务加权，
+应先用 LoRA 版的小规模校准，不能用 SMoPE 分布外推——但 LoRA 无 dense 阶段，且本条的
+0.287/0.161 s/样本已可用于粗估。

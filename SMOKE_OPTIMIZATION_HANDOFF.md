@@ -1843,3 +1843,45 @@ the size of tensor b (0) at non-singleton dimension 1`。
 
 修复经维护者提交并 `git pull` 后，正式 seed-0 以**全新输出目录**重跑（失败目录按纪律
 保留）；同样修复后 P2 的 `--resume` 路径不受影响（其样本数可整除）。
+
+### 12.13.4 维护者裁定与代码修复（2026-10-16）
+
+**裁定：采用选项 1，不采用 `drop_last` 或末批补样本。** 上游固定版本
+`transformers==5.3.0` 的 `Qwen3_5Model.compute_3d_position_ids` 将 `rope_deltas` 保存在模型
+实例上；它是单次多模态输入/生成的批级状态，不应被下一个独立 batch 继承。因此清理缓存
+是恢复预期语义，不改变样本集合、loss 权重、global batch、optimizer updates 或论文协议。
+
+实际实现比原提案多覆盖两个同类入口：`QwenCoINModel.forward`、`observe_routes` 和
+`generate` 均在每个**独立顶层调用开始前**清空 mRoPE 批缓存。`generate` 只在整次生成开始
+前清一次，内部 autoregressive decode 仍可正常复用本次生成刚计算的 `rope_deltas`。这既修复
+ScienceQA 的 B=3 纯文本末批，也防止 route scan 或连续评测 batch 在尺寸/模态变化时触发
+同一上游缺陷。
+
+实现没有在每步遍历全模型：初始化时只记录唯一 `Qwen3_5Model` 的模块路径，调用时使用
+`get_submodule` 定位并置空，开销为 O(模块嵌套深度)，相对模型前向可忽略；该路径同时兼容
+直接 backbone 与 PEFT 包装。若未来模型树出现多个 mRoPE cache owner，初始化直接报错，
+避免静默清错对象。
+
+本地验证：
+
+- 新增回归测试构造“上一批留下 `(4,1)` → 下一批 B=3”的状态，确认训练 forward、route
+  observation、generation 三个独立入口进入 backbone 时均已为 `None`；
+- 完整 `tests_qwen` **40/40 通过**，`python -m compileall -q qwen_smope scripts/qwen
+  tests_qwen` 通过；Windows 本地测试将 `tempfile.tempdir` 指向仓库内可写临时目录，首次系统
+  `%TEMP%` 的 19 个 `PermissionError` 是桌面沙箱权限，不是测试或代码失败；
+- 本地没有 H100、正式数据和服务器固定 Transformers 环境，因此**不得把单元测试写成正式
+  seed-0 已通过**。
+
+服务器执行纪律：
+
+1. `git pull --ff-only origin v2`，确认 HEAD 为本节对应修复提交；
+2. 先重跑 §12.13.1 的两个顺序 batch 复现：B=4 含图后接 B=3 纯文本，判据为不再出现
+   shape mismatch、loss/梯度有限，且两 rank 均通过；
+3. 复现门禁通过后，以**新的输出根目录**重启 exact-full-route seed-0；不得 `--resume`
+   没有 checkpoint 的失败目录，也不得覆盖/删除该目录；
+4. ScienceQA dense 首轮至少越过原失败点并成功写出任务 1 checkpoint 后，才把修复状态从
+   “本地已验证”更新为“服务器已验证”；随后仍需按 §12.8.3/§12.12.3 的全程判据验收。
+
+若两 batch 复现仍失败，立即停止正式 run，并回传两 rank 完整 traceback、两批的
+`batch_size / image_grid_thw / mm_token_type_ids / rope_deltas.shape`，不得转用 `drop_last`
+绕过问题。

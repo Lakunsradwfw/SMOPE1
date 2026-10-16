@@ -170,6 +170,17 @@ class QwenCoINModel(nn.Module):
         self.method = method
         self.router_weight, self.old_weight, self.balance_weight = router_weight, old_weight, balance_weight
         self.layer_ids: list[int] = []
+        # transformers==5.3.0 stores multimodal RoPE deltas on Qwen3_5Model,
+        # although they are scoped to one independent batch/generation.  Keep
+        # the module path rather than the module itself so PyTorch does not
+        # register the same submodule twice (and get_submodule stays O(depth)).
+        rope_owners = [
+            name for name, module in backbone.named_modules()
+            if module.__class__.__name__ == "Qwen3_5Model" and hasattr(module, "rope_deltas")
+        ]
+        if len(rope_owners) > 1:
+            raise RuntimeError(f"Expected one Qwen3_5Model mRoPE cache owner, found {rope_owners}")
+        self._rope_cache_owner_path = rope_owners[0] if rope_owners else None
         if method == "smope":
             for name, module in backbone.named_modules():
                 if module.__class__.__name__ == "Qwen3_5Attention" and "language_model" in name:
@@ -190,6 +201,18 @@ class QwenCoINModel(nn.Module):
         for expert in self.expert_modules():
             expert.clear_route()
 
+    def _reset_mrope_cache(self) -> None:
+        """Reset batch-scoped Qwen3.5 state before an independent top-level call.
+
+        Generation is reset once before ``generate`` and may then reuse the
+        newly computed deltas throughout its own autoregressive decode.
+        """
+        if self._rope_cache_owner_path is None:
+            return
+        owner = (self.backbone if self._rope_cache_owner_path == ""
+                 else self.backbone.get_submodule(self._rope_cache_owner_path))
+        owner.rope_deltas = None
+
     def _context(self, router_mask: torch.Tensor | None, dense: bool, freeze: bool) -> None:
         for module in self.backbone.modules():
             if hasattr(module, "experts_enabled"):
@@ -197,6 +220,7 @@ class QwenCoINModel(nn.Module):
 
     def forward(self, inputs: dict[str, torch.Tensor], router_mask: torch.Tensor,
                 dense: bool = False) -> dict[str, torch.Tensor]:
+        self._reset_mrope_cache()
         self.clear_routes()
         self._context(router_mask, dense, False)
         outputs = self.backbone(**inputs, use_cache=False, return_dict=True)
@@ -214,6 +238,7 @@ class QwenCoINModel(nn.Module):
     @torch.no_grad()
     def observe_routes(self, inputs: dict[str, torch.Tensor], router_mask: torch.Tensor) -> None:
         """Populate selected expert indices without materializing full-sequence LM logits."""
+        self._reset_mrope_cache()
         self.clear_routes()
         self._context(router_mask, False, False)
         route_inputs = {key: value for key, value in inputs.items() if key != "labels"}
@@ -223,6 +248,7 @@ class QwenCoINModel(nn.Module):
     def generate(self, inputs: dict[str, torch.Tensor], router_mask: torch.Tensor, **kwargs) -> torch.Tensor:
         if kwargs.get("num_beams", 1) != 1:
             raise ValueError("Fixed SMoPE routes currently require num_beams=1")
+        self._reset_mrope_cache()
         self.clear_routes()
         self._context(router_mask, False, True)
         return self.backbone.generate(**inputs, **kwargs)

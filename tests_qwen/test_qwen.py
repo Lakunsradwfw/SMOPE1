@@ -749,6 +749,58 @@ class ExpertTests(unittest.TestCase):
         self.assertEqual(float(result["old_loss"]), 0.0)
         self.assertEqual(float(result["balance_loss"]), 0.0)
 
+    def test_independent_calls_reset_qwen35_mrope_batch_cache(self):
+        class Qwen3_5Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.rope_deltas = torch.ones(4, 1)
+
+        class TinyBackbone(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = Qwen3_5Model()
+                self.cache_seen = []
+
+            def _observe_and_repopulate(self):
+                self.cache_seen.append(self.model.rope_deltas)
+                self.model.rope_deltas = torch.ones(3, 1)
+
+            def forward(self, input_ids, **kwargs):
+                self._observe_and_repopulate()
+                return SimpleNamespace(loss=input_ids.float().sum() * 0)
+
+            def generate(self, input_ids, **kwargs):
+                self._observe_and_repopulate()
+                return input_ids
+
+        class PeftLikeBackbone(torch.nn.Module):
+            def __init__(self, base_model):
+                super().__init__()
+                self.base_model = base_model
+
+            def forward(self, *args, **kwargs):
+                return self.base_model(*args, **kwargs)
+
+            def generate(self, *args, **kwargs):
+                return self.base_model.generate(*args, **kwargs)
+
+        inputs = {"input_ids": torch.ones(3, 2, dtype=torch.long)}
+        router_mask = torch.ones(3, 2, dtype=torch.bool)
+        for wrapped, expected_path in ((False, "model"), (True, "base_model.model")):
+            with self.subTest(peft_like=wrapped):
+                base = TinyBackbone()
+                backbone = PeftLikeBackbone(base) if wrapped else base
+                model = QwenCoINModel(backbone, method="zero_shot")
+
+                model(inputs, router_mask)
+                base.model.rope_deltas = torch.ones(4, 1)
+                model.observe_routes(inputs, router_mask)
+                base.model.rope_deltas = torch.ones(4, 1)
+                model.generate(inputs, router_mask)
+
+                self.assertEqual(model._rope_cache_owner_path, expected_path)
+                self.assertEqual(base.cache_seen, [None, None, None])
+
 
 class ScoringReportTests(unittest.TestCase):
     def test_failed_stage_preserves_primary_error_without_epilogue_collectives(self):

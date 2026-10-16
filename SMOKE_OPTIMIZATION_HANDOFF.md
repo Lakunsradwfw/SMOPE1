@@ -1685,3 +1685,161 @@ P2 的 §12.8.3 四项判据全部通过后，直接启动 §12.4 的 SMoPE exac
 吞吐标定。若官方同源7文件确实无法取得，停止并把可验证的失败 URL/官方包检查结果回传维护者，
 届时才实施“完整评测 split 先确定性过滤35条、再按固定 seed 抽 N=1000、写入 manifest”的备用
 代码路径，并要求三种方法和所有 seed 从同一过滤清单重新开始。
+
+## 12.11 服务器执行记录：官方同源恢复不可达（2026-10-16，`0727120`）——按令停止并回传
+
+> 按 §12.10 执行。**结论：服务器无法获取任何官方同源文件（出口策略 + 官方包托管的域名均
+> 不可达），按维护者指令“找不到官方同源文件时停止并回传，不能自行切换到剔除方案”停止。
+> 未做任何剔除、未改动评测集、未重编码任何图片。** 全部证据在
+> `outputs/coin-qwen3.5-9b/verify-20261015c/eval-image-repair/`。
+
+### 12.11.1 恢复目标与官方来源
+
+7 个目标的 `dataset.json.imageURL`（本地 `/root/coin-stage/repo/cl_dataset/OCR-VQA/dataset.json`
+与镜像同源，键=image id）：
+
+| image_id | 官方 imageURL（同源文件路径） |
+|---|---|
+| 1285442962 | `http://ecx.images-amazon.com/images/I/51qGnoKlZvL.jpg` |
+| 1421539896 | `http://ecx.images-amazon.com/images/I/611qJzGW%2B9L.jpg` |
+| 1558210571 | `http://ecx.images-amazon.com/images/I/51Yg2R6wrCL.jpg` |
+| 1609619919 | `http://ecx.images-amazon.com/images/I/51KrFYJk7xL.jpg` |
+| 1931271070 | `http://ecx.images-amazon.com/images/I/41tRhPDGZyL.jpg` |
+| 615754090 | `http://ecx.images-amazon.com/images/I/51Lkui-R5PL.jpg` |
+| 857194321 | `http://ecx.images-amazon.com/images/I/41JHZGCjxwL.jpg` |
+
+官方发布包入口（官方页 `https://ocr-vqa.github.io/` → “Dataset: Downloads”，页面与 README
+原文已存档）：`https://drive.google.com/drive/folders/1_GYPY5UkUy7HIcR0zq3ZCFgeZN7BAfm_`。
+
+### 12.11.2 探测结果：两条官方来源均不可达（证据已归档）
+
+1. **7 个同源 URL：http 与 https 从服务器全部失败**（curl -4，`000`；IPv6 即时失败）。
+   逐 URL 实测保存于 `eval-image-repair/official-url-probes-20261016.json`。
+   旁证：原始镜像构建时的 `_failed_urls.json` 对这 7 个 id（属于其 67 个失败 id）已记录
+   `HTTP 404`/`ReadTimeout` —— 该源当时就不稳定。
+2. **官方发布包在 Google Drive：drive.google.com 不可达**（`000`）。
+3. **服务器外网出口仅为白名单通路**（`eval-image-repair/egress-map-20261016.txt`）：
+   pypi.org `200`、github.com `200`、ocr-vqa.github.io `200`；而 drive.google.com、
+   amazon.com、m.media-amazon.com（Amazon 现行图床）、huggingface.co 全部 `000`。
+   这证明失败是**出口策略限制**，不是个别 URL 临时故障。
+4. **本地无既有副本**：`/root/coin-stage/repo/cl_dataset/OCR-VQA/images/` 有该镜像的完整
+   staging 副本（207,505 张、9.0 GB），但恰好缺这 7 个；缺集与 dataset.json 条目数之差
+   （207,572−207,505=67）恰为 `_failed_urls.json` 的 67 个 id。全盘 `find` 无结果；
+   dataset.json 中也**没有其他 id 与这 7 个 URL 相同**（无法从别名文件恢复同源字节）。
+
+### 12.11.3 发布通道已就绪（等文件到货即可执行）
+
+`/root/coin-stage/putdir.py`（HTTP PUT 直连 WebDAV，~7ms/文件，不经过 davfs）已存在并经历史
+使用验证。文件一旦就位（由维护者从可访问外网的机器取得），服务器执行：
+staging 目录 → 逐文件 Pillow `verify()` + RGB decode + SHA256/字节/宽高/下载 UTC 审计 →
+写 `eval-image-repair-manifest.json` → putdir 原子发布到 `CoIN/cl_dataset/OCR-VQA/images/` →
+§12.10.2 三项门禁（HTTP 200+SHA 一致、全量探针 0 缺图、N=1000 子集 0 缺图且 ID 不变）→
+原命令 `--resume`。**在文件到货并过门禁前，P2 与正式 seed-0 保持停止。**
+
+### 12.11.4 请维护者选择的供图方式（两种均为“官方同源”）
+
+1. 在本地网络直接下载上表 7 个 `ecx.images-amazon.com` URL（若本地可达，最快）；
+2. 或从官方 Drive 包（`OCR-VQAimages.zip`，约 2.6GB）解出这 7 个 id 的文件。
+无论哪种，请保留下载物原字节（不得重编码），放到服务器后由本流程完成审计与发布；
+若本地也确认不可达，请回传实测结果，再讨论 §12.10.3 的备用代码路径。
+
+## 12.12 服务器执行记录：图像恢复四项门禁通过、P2 完成（2026-10-16，`db0d15f`）
+
+> 维护者提交 `db0d15f`（含 7 图 ZIP + provenance + 下载脚本）。服务器全流程：
+> 审计→发布→三项数据门禁→P2 resume→四项判据→ETA 重算。**P2 判定完成，正式
+> SMoPE exact-full-route seed-0 已按 §12.10.3 授权启动（见 12.12.4）。**
+
+### 12.12.1 审计与发布（§12.10.2 门禁）
+
+- ZIP SHA-256 = `0cf222357a42c1aef4a93bf6a805c9f704060f23b4e8763d4f7c2895e2063a03`（与维护者
+  回传一致）；解包 8 文件（7 JPG + provenance）；服务器端独立复核 7/7 SHA-256 与 provenance
+  **全部一致**。来源类型：6 张 `official_dataset_json_imageURL`（直连 200），
+  `1421539896` 为 `internet_archive_raw_capture_of_official_dataset_url`（原 URL 现 404，
+  Wayback 2014-03-07 原字节回放，cdx_digest 记录在 provenance）。
+- 审计脚本 `eval-image-repair/publish_eval_images.py`（Pillow verify + RGB decode + SHA256/字节/
+  宽高 + provenance 交叉校验）→ `eval-image-repair-manifest.json` → MKCOL+PUT 到
+  `CoIN/cl_dataset/OCR-VQA/images/`（7×201）→ 同一训练 URL 回读 7×200 且 SHA-256 逐字节
+  一致。日志 `eval-image-repair/publish-run.log`。
+
+### 12.12.2 三项数据门禁
+
+| 门禁 | 结果 |
+|---|---|
+| 1. 7 目标 HTTP 200 + SHA 一致 + 可解码 | **通过**（7/7，字节级一致） |
+| 2. 全量探针重跑（99,926 条） | **通过**：`missing=0`, `other_errors=0`（`eval-probes/OCRVQA-test-recheck.json`；原 35 缺图快照仍保留为 `OCRVQA-test.json`） |
+| 3. 正式 N=1000/seed=42 子集重查 | **通过**：8 任务全部 0 命中（`eval-subset-missing.json` 含 `subset_ids_sha256`）；`1421539896_0` **仍在**子集中（未换样本、未改集合） |
+
+### 12.12.3 P2 resume 与四项判据（§12.8.3）
+
+同一命令追加 `--resume`（`p2-gloo-resume2.log`，wall 1107.53s；随后一次“秒级收尾”复核
+`p2-resume3-check.log`，41s 正常收尾——判据 3 明确要求的二次 resume 检查）。
+
+| 判据 | 结果 |
+|---|---|
+| 1. 环境记录与日志 | **通过**：`resume_environment.json` 记 `python_object=gloo / 600s / git db0d15f`；日志 0 个 mismatch/timeout/OOM/非有限值 |
+| 2. resume 完成度 | **通过**：OCRVQA sparse 8000/500、route 与 8 个评测 cell 全完成；`run_complete` 恰两条且最后一条为二次 resume 复核（由判据 3 要求） |
+| 3. 产物完整 | **通过**：`next_task=8`、matrix 8 行（末行 8 cell）；`after_08_OCRVQA/` 8 个非空 JSONL（OCRVQA.jsonl 52,932B）；36 cell 齐；二次 resume 41s 收尾 |
+| 4. ETA 重算（§12.2 公式，任务 1-7 用首跑、任务 8 用本次 resume） | **通过** |
+
+```
+T_sparse = 7.512h   T_dense = 0.146h   T_route = 7.378h
+加权 route 吞吐 = 21.47 条/s（判据 ≥18 ✓）
+T_eval_upper = 1.871h（36 cells 原始 1347.1s ×5）
+T_fixed = 0.027h（A 64.2s/6739s + B 34.2s/1107.5s）
+T_full_upper = 16.934h ≤ 23h  →  授权正式 seed-0
+```
+
+计算脚本与所选 event 行选择规则：`verify-20261015c/eta_calc_final.py`（输出
+`eval-image-repair/eta-final.log`）。
+
+### 12.12.4 正式 run
+
+四项判据全过后，按 §12.4 直接启动 **SMoPE exact-full-route seed-0**
+（`OUTPUT_ROOT=outputs/coin-qwen3.5-9b/formal-full-route`，双卡、no-GC、full route、
+eval N=1000）。**启动：2026-10-16 07:12 UTC，git `db0d15f`**，日志
+`outputs/coin-qwen3.5-9b/formal-full-route-seed0.log`，目标产物
+`outputs/coin-qwen3.5-9b/formal-full-route/smope/full/seed-0/`；按重算 ETA 预期约 17h。
+seed-1/2 待 seed-0 的 summary、36-cell predictions、routing 与 checkpoint 齐全后再启动。
+
+**启动前磁盘告警（留档）**：根分区 50G 已用 99%（余 759M）。服务器清单实测正式 run 的
+写入量 <25MB（预测 ~9.5M/routing ~1.3M/events ~2M/adapter 10M），故按计划启动并需在运行
+期间监控 `df`。**07:3x UTC 维护者点名授权后清理了两个纯缓存**（HF 下载缓存 977M、
+Triton 编译缓存 857M），余量 838M → 2.7G；数据 staging 与产物未动；清理后正式 run
+继续正常（ScienceQA dense 顺利推进，无错误）。
+
+## 12.13 正式 seed-0 首次启动失败：短末批触发 transformers mrope 缓存缺陷（已复现，2026-10-16）
+
+> 07:12 启动，07:22:13 失败（ScienceQA dense 的**最后一个 microbatch**），rank 1
+> exitcode 1、`RuntimeError`；rank 0 被 torchrun 终止。**未写出任何 checkpoint（任务 1
+> 尚未完成），失败目录保留**：`formal-full-route/smope/full/seed-0/`，日志
+> `formal-full-route-seed0.log`。与磁盘清理无关（错误为纯张量形状问题）。
+
+### 12.13.1 根因（已单进程复现，同一错误字符串）
+
+触发链：ScienceQA 完整训练集 12,726 条 → 每 rank 6,363 条 → **末 microbatch 只有 3 条**
+（历史所有运行每 rank 样本数都能被 4 整除，从未出现短批）→ 该批恰好全为纯文本（无图）→
+transformers `modeling_qwen3_5.py::compute_3d_position_ids` 走
+`elif self.rope_deltas is not None` 分支，用**上一次前向缓存的 `rope_deltas`（形状 (4,1)，
+来自含图的 B=4 批）**：`delta = rope_deltas.repeat_interleave(3 // 4 = 0, dim=0)` → 空张量
+→ `position_ids(B=3) + delta(dim1=0)` → `RuntimeError: The size of tensor a (3) must match
+the size of tensor b (0) at non-singleton dimension 1`。
+
+复现（单卡、顺序两批）：B=4 含图批（缓存 rope_deltas=(4,1)）→ 该 B=3 纯文本末批 → 同错误
+字符串。**排除项**：与 triton 缓存删除无关（shape 错误、rank0 存活）；与图像恢复无关
+（ScienceQA）；数据本身无异常。
+
+### 12.13.2 修复选项（需维护者裁定；不在服务器侧擅自改）
+
+1. **训练前向防呆（推荐，语义中性）**：`QwenCoINModel.forward`（训练路径）在每次前向前
+   `self.backbone.model.rope_deltas = None`。纯文本批 → `position_ids=None` → 模型按
+   cache_position 推断一维位置（与首个批/全文本序列的既有路径一致；纯文本序列上 1D 与
+   mrope 等价）；含图短批仍走 mrope。
+2. `drop_last=True`（训练 loader）：丢弃每 rank 末批 3 条 → 改变每 epoch 样本视 口，
+   需要协议披露，不推荐首选。
+3. 末批 padding 到 4：改变 loss 语 义，不推荐。
+4. 等上游 transformers 修复：不可行动作。
+
+### 12.13.3 待办
+
+修复经维护者提交并 `git pull` 后，正式 seed-0 以**全新输出目录**重跑（失败目录按纪律
+保留）；同样修复后 P2 的 `--resume` 路径不受影响（其样本数可整除）。
